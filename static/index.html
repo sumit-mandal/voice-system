@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Healthcare voice — browser test</title>
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.9.8/dist/livekit-client.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #f4f6f4;
+      --ink: #1a221c;
+      --muted: #5c6b60;
+      --line: #c9d3cb;
+      --accent: #1f6b4a;
+      --card: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+    }
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 40px 20px 64px;
+    }
+    h1 {
+      font-family: "IBM Plex Serif", Georgia, serif;
+      font-weight: 600;
+      font-size: 1.75rem;
+      margin: 0 0 8px;
+    }
+    p.lead { color: var(--muted); margin: 0 0 28px; line-height: 1.5; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    h2 { font-size: 1rem; margin: 0 0 12px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    button {
+      appearance: none;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: transparent;
+      color: var(--accent);
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #log, #meta {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      background: #eef2ef;
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 240px;
+      overflow: auto;
+      margin-top: 12px;
+    }
+    .hint { color: var(--muted); font-size: 0.9rem; margin-top: 8px; }
+    audio { width: 100%; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Browser voice test</h1>
+    <p class="lead">
+      Live stream your mic into LiveKit, hear the agent (PocketTTS), and verify
+      faster-whisper STT. Allow microphone access when prompted.
+    </p>
+
+    <section>
+      <h2>1) Quick STT ↔ TTS (no LLM)</h2>
+      <p class="hint">Record ~4 seconds, transcribe, then play “I heard you say…”.</p>
+      <div class="row">
+        <button id="btnQuick" type="button">Record &amp; test STT/TTS</button>
+        <span id="quickStatus" class="hint"></span>
+      </div>
+      <audio id="quickAudio" controls></audio>
+    </section>
+
+    <section>
+      <h2>2) Phone call me (Twilio outbound)</h2>
+      <p class="hint">
+        Twilio dials your phone from the Twilio number. When you answer, you are
+        bridged into the same LiveKit agent. Trial accounts can only call
+        <strong>verified</strong> numbers.
+      </p>
+      <div class="row">
+        <input
+          id="phoneTo"
+          type="tel"
+          placeholder="+9198XXXXXXXX"
+          style="flex:1;min-width:180px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font:inherit"
+        />
+        <button id="btnCallMe" type="button">Call me</button>
+      </div>
+      <div id="callMeStatus" class="hint"></div>
+    </section>
+
+    <section>
+      <h2>3) Live agent (LiveKit streaming)</h2>
+      <p class="hint">
+        Needs Docker LiveKit + <code>./scripts/run_worker.sh</code> running.
+        Flow: name → age → ready? → diseases → medications → goodbye.
+      </p>
+      <div class="row">
+        <button id="btnStart" type="button">Start live session</button>
+        <button id="btnStop" class="secondary" type="button" disabled>Disconnect</button>
+      </div>
+      <div id="meta">Not connected</div>
+      <div id="log"></div>
+    </section>
+  </main>
+
+  <script>
+    const { Room, RoomEvent, Track, createLocalAudioTrack } = LivekitClient;
+
+    const logEl = document.getElementById("log");
+    const metaEl = document.getElementById("meta");
+    const quickStatus = document.getElementById("quickStatus");
+    const quickAudio = document.getElementById("quickAudio");
+
+    let room = null;
+
+    function log(msg) {
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      console.log(line);
+      logEl.textContent = `${line}\n` + logEl.textContent;
+    }
+
+    // --- Quick STT/TTS (record WAV via AudioContext) ---
+    function encodeWav(float32, sampleRate) {
+      const buffer = new ArrayBuffer(44 + float32.length * 2);
+      const view = new DataView(buffer);
+      const writeStr = (offset, str) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+      };
+      writeStr(0, "RIFF");
+      view.setUint32(4, 36 + float32.length * 2, true);
+      writeStr(8, "WAVE");
+      writeStr(12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeStr(36, "data");
+      view.setUint32(40, float32.length * 2, true);
+      let offset = 44;
+      for (let i = 0; i < float32.length; i++, offset += 2) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+      return new Blob([buffer], { type: "audio/wav" });
+    }
+
+    document.getElementById("btnQuick").onclick = async () => {
+      const btn = document.getElementById("btnQuick");
+      btn.disabled = true;
+      quickStatus.textContent = "Recording 4s…";
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const ctx = new AudioContext();
+        const source = ctx.createMediaStreamSource(stream);
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        const chunks = [];
+        processor.onaudioprocess = (e) => {
+          chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+        };
+        source.connect(processor);
+        processor.connect(ctx.destination);
+        await new Promise((r) => setTimeout(r, 4000));
+        processor.disconnect();
+        source.disconnect();
+        stream.getTracks().forEach((t) => t.stop());
+
+        const length = chunks.reduce((n, c) => n + c.length, 0);
+        const merged = new Float32Array(length);
+        let off = 0;
+        for (const c of chunks) { merged.set(c, off); off += c.length; }
+        // Resample to 16k for Whisper.
+        const ratio = 16000 / ctx.sampleRate;
+        const targetLen = Math.floor(merged.length * ratio);
+        const resampled = new Float32Array(targetLen);
+        for (let i = 0; i < targetLen; i++) {
+          resampled[i] = merged[Math.min(merged.length - 1, Math.floor(i / ratio))] || 0;
+        }
+        await ctx.close();
+
+        const wav = encodeWav(resampled, 16000);
+        quickStatus.textContent = `Uploading ${wav.size} bytes…`;
+        const form = new FormData();
+        form.append("audio", wav, "mic.wav");
+        const res = await fetch("/browser/stt-tts", { method: "POST", body: form });
+        if (!res.ok) throw new Error(await res.text());
+        const transcript = res.headers.get("X-Transcript") || "";
+        const out = await res.blob();
+        quickAudio.src = URL.createObjectURL(out);
+        await quickAudio.play();
+        quickStatus.textContent = `Transcript: ${transcript}`;
+      } catch (err) {
+        console.error(err);
+        quickStatus.textContent = `Error: ${err.message || err}`;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    // --- Twilio outbound: call my phone ---
+    document.getElementById("btnCallMe").onclick = async () => {
+      const btn = document.getElementById("btnCallMe");
+      const status = document.getElementById("callMeStatus");
+      const to = (document.getElementById("phoneTo").value || "").trim();
+      if (!/^\+[1-9]\d{7,14}$/.test(to)) {
+        status.textContent = "Enter E.164 number, e.g. +9198XXXXXXXX";
+        return;
+      }
+      btn.disabled = true;
+      status.textContent = `Dialing ${to}…`;
+      try {
+        const res = await fetch("/twilio/voice/outbound", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ to }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.detail || JSON.stringify(body) || res.statusText);
+        status.textContent =
+          `Queued CallSid=${body.call_sid} status=${body.status}. Answer your phone.`;
+      } catch (err) {
+        console.error(err);
+        status.textContent = `Error: ${err.message || err}`;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    // --- LiveKit live agent ---
+    document.getElementById("btnStart").onclick = async () => {
+      const btnStart = document.getElementById("btnStart");
+      const btnStop = document.getElementById("btnStop");
+      btnStart.disabled = true;
+      try {
+        log("Requesting browser session…");
+        const res = await fetch("/browser/session", { method: "POST" });
+        if (!res.ok) throw new Error(await res.text());
+        const session = await res.json();
+        metaEl.textContent = JSON.stringify(session, null, 2);
+        log(`Session room=${session.room_name} call_sid=${session.call_sid}`);
+
+        room = new Room({ adaptiveStream: true, dynacast: true });
+        room
+          .on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+            log(`TrackSubscribed kind=${track.kind} from=${participant.identity}`);
+            if (track.kind === Track.Kind.Audio) {
+              const el = track.attach();
+              el.autoplay = true;
+              document.body.appendChild(el);
+              log("Attached remote agent audio element");
+            }
+          })
+          .on(RoomEvent.TrackUnsubscribed, (track) => {
+            track.detach().forEach((el) => el.remove());
+            log("TrackUnsubscribed");
+          })
+          .on(RoomEvent.Disconnected, () => log("Disconnected"))
+          .on(RoomEvent.ParticipantConnected, (p) => log(`ParticipantConnected ${p.identity}`));
+
+        log(`Connecting to ${session.livekit_url}…`);
+        await room.connect(session.livekit_url, session.token);
+        log("Connected to room");
+
+        const mic = await createLocalAudioTrack({ echoCancellation: true, noiseSuppression: true });
+        await room.localParticipant.publishTrack(mic);
+        log("Microphone published — wait for agent greeting, then speak");
+
+        btnStop.disabled = false;
+      } catch (err) {
+        console.error(err);
+        log(`Error: ${err.message || err}`);
+        btnStart.disabled = false;
+      }
+    };
+
+    document.getElementById("btnStop").onclick = async () => {
+      if (room) {
+        await room.disconnect();
+        room = null;
+      }
+      document.getElementById("btnStart").disabled = false;
+      document.getElementById("btnStop").disabled = true;
+      log("Stopped");
+    };
+  </script>
+</body>
+</html>
