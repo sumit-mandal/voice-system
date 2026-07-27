@@ -60,6 +60,8 @@ def _migrate_sqlite_columns() -> None:
         "ready_to_proceed": "BOOLEAN",
         "diseases": "TEXT",
         "medications": "TEXT",
+        "handoff_reason": "VARCHAR(256)",
+        "handoff_summary": "TEXT",
     }
     with engine.begin() as conn:
         rows = conn.exec_driver_sql("PRAGMA table_info(call_sessions)").fetchall()

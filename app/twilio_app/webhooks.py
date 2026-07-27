@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 
-from fastapi import APIRouter, Form, HTTPException, Request, Response
+from fastapi import APIRouter, Form, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from twilio.rest import Client
 from twilio.twiml.voice_response import Dial, VoiceResponse
@@ -20,6 +20,8 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/twilio", tags=["twilio"])
 
 _E164 = re.compile(r"^\+[1-9]\d{7,14}$")
+# Short-lived whisper text for human agents, keyed by original caller CallSid.
+_HANDOFF_WHISPER: dict[str, str] = {}
 
 
 class OutboundCallRequest(BaseModel):
@@ -198,15 +200,110 @@ async def call_status(
         db = SessionLocal()
         try:
             row = repo.get_by_call_sid(db, CallSid)
-            if row and row.status == "in_progress":
+            if row and row.status in {"in_progress", "handoff_pending"}:
                 repo.update_intake(
                     db,
                     call_sid=CallSid,
                     patient_name=row.patient_name,
                     patient_age=row.patient_age,
                     transcript=row.transcript,
+                    handoff_reason=row.handoff_reason,
+                    handoff_summary=row.handoff_summary,
                     status=f"ended_{CallStatus}",
                 )
         finally:
             db.close()
     return {"ok": "true"}
+
+
+@router.post("/voice/handoff")
+async def handoff_dial(
+    CallSid: str = Form(...),
+) -> Response:
+    """
+    TwiML for cold transfer: dial the configured human agent number.
+
+    Twilio hits this after the worker redirects the live CallSid away from LiveKit SIP.
+    """
+    settings = get_settings()
+    agent = (settings.twilio_human_agent_number or "").strip()
+    log.info("Handoff dial TwiML | CallSid=%s agent=%s", CallSid, agent)
+
+    db = SessionLocal()
+    try:
+        row = repo.get_by_call_sid(db, CallSid)
+        summary = (row.handoff_summary if row else None) or ""
+        reason = (row.handoff_reason if row else None) or ""
+        if row:
+            repo.update_intake(
+                db,
+                call_sid=CallSid,
+                patient_name=row.patient_name,
+                patient_age=row.patient_age,
+                ready_to_proceed=row.ready_to_proceed,
+                diseases=row.diseases,
+                medications=row.medications,
+                transcript=row.transcript,
+                handoff_reason=row.handoff_reason,
+                handoff_summary=row.handoff_summary,
+                status="handed_off",
+            )
+    finally:
+        db.close()
+
+    response = VoiceResponse()
+    if not _E164.match(agent):
+        log.error("TWILIO_HUMAN_AGENT_NUMBER missing/invalid — cannot hand off")
+        response.say(
+            "I'm sorry, no human agent is available right now. Please try again later."
+        )
+        response.hangup()
+        return Response(content=str(response), media_type="application/xml")
+
+    # Whisper a short context line to the agent after they answer (caller hears hold).
+    whisper_bits = [p for p in (reason, summary) if p]
+    whisper = "Incoming handoff from AI intake. " + " ".join(whisper_bits)
+    if len(whisper) > 400:
+        whisper = whisper[:397] + "..."
+
+    response.say("Please hold while I connect you.")
+    dial: Dial = Dial(
+        caller_id=settings.twilio_phone_number or None,
+        answer_on_bridge=True,
+    )
+    # Number noun url: TwiML runs for the agent only before bridging.
+    # Pass original CallSid so whisper can load the intake summary.
+    whisper_url = (
+        f"{settings.public_base_url.strip().rstrip('/')}/twilio/voice/handoff-whisper"
+        f"?original_call_sid={CallSid}"
+    )
+    dial.number(agent, url=whisper_url)
+    response.append(dial)
+    log.debug("Handoff TwiML | CallSid=%s whisper_len=%s", CallSid, len(whisper))
+    _HANDOFF_WHISPER[CallSid] = whisper
+    return Response(content=str(response), media_type="application/xml")
+
+
+@router.post("/voice/handoff-whisper")
+async def handoff_whisper(
+    original_call_sid: str = Query(default=""),
+    CallSid: str = Form(default=""),
+    ParentCallSid: str = Form(default=""),
+) -> Response:
+    """Say intake context to the human agent only (Dial number callback)."""
+    key = original_call_sid or ParentCallSid or CallSid
+    text = _HANDOFF_WHISPER.pop(key, None) if key else None
+    if not text and key:
+        db = SessionLocal()
+        try:
+            row = repo.get_by_call_sid(db, key)
+            if row and row.handoff_summary:
+                text = f"Incoming handoff. {row.handoff_summary}"
+        finally:
+            db.close()
+    if not text:
+        text = "Incoming handoff from the AI intake assistant."
+    log.info("Handoff whisper | key=%s text=%r", key, text[:200])
+    response = VoiceResponse()
+    response.say(text)
+    return Response(content=str(response), media_type="application/xml")

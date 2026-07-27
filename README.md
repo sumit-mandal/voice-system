@@ -16,6 +16,7 @@ This project targets **open-source LiveKit** via Docker — not LiveKit Cloud.
 | faster-whisper | STT |
 | PocketTTS | TTS |
 | SQLite | Persist name, age, transcript |
+| Human handoff | LangGraph detects intent → Twilio cold-transfers to `TWILIO_HUMAN_AGENT_NUMBER` |
 
 ## Setup
 

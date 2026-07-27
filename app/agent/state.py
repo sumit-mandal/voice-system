@@ -20,4 +20,7 @@ class IntakeState(TypedDict):
     reply: str
     is_complete: bool
     should_end: bool
+    handoff_requested: bool
+    handoff_reason: str
+    handoff_summary: str
     validation_notes: str

@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_phone_number: str = ""
+    # E.164 number to dial when the AI hands off to a human (cold transfer).
+    twilio_human_agent_number: str = ""
 
     livekit_url: str = "ws://localhost:7880"
     # Browser clients need a publicly reachable WSS URL (not localhost).

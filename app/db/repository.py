@@ -57,15 +57,19 @@ def update_intake(
     medications: str | None = None,
     transcript: str | None = None,
     status: str,
+    handoff_reason: str | None = None,
+    handoff_summary: str | None = None,
 ) -> CallSession:
     log.debug(
-        "DB update_intake | call_sid=%s name=%s age=%s ready=%s diseases=%r meds=%r status=%s",
+        "DB update_intake | call_sid=%s name=%s age=%s ready=%s diseases=%r meds=%r "
+        "handoff_reason=%r status=%s",
         call_sid,
         patient_name,
         patient_age,
         ready_to_proceed,
         diseases,
         medications,
+        handoff_reason,
         status,
     )
     row = get_by_call_sid(db, call_sid)
@@ -84,6 +88,10 @@ def update_intake(
         row.medications = medications
     if transcript is not None:
         row.transcript = transcript
+    if handoff_reason is not None:
+        row.handoff_reason = handoff_reason
+    if handoff_summary is not None:
+        row.handoff_summary = handoff_summary
     row.status = status
     db.commit()
     db.refresh(row)

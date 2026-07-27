@@ -25,6 +25,8 @@ class CallSession(Base):
     ready_to_proceed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     diseases: Mapped[str | None] = mapped_column(Text, nullable=True)
     medications: Mapped[str | None] = mapped_column(Text, nullable=True)
+    handoff_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    handoff_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

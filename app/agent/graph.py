@@ -1,4 +1,4 @@
-"""LangGraph intake graph: extract/validate → save when complete or not-ready."""
+"""LangGraph intake graph: extract/validate → save when complete, not-ready, or handoff."""
 
 from __future__ import annotations
 
@@ -19,6 +19,9 @@ log = get_logger(__name__)
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _PENDING = {"name", "age", "ready", "diseases", "medications", None}
+_DEFAULT_HANDOFF_REPLY = (
+    "Of course. I'll connect you with a specialist now. Please hold."
+)
 
 
 def _parse_llm_json(raw: str) -> dict[str, Any]:
@@ -41,6 +44,30 @@ def _nonempty_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _build_handoff_summary(state: IntakeState, data: dict[str, Any]) -> str:
+    provided = _nonempty_text(data.get("handoff_summary"))
+    if provided:
+        return provided
+    parts: list[str] = []
+    name = state.get("patient_name") or data.get("patient_name")
+    age = state.get("patient_age")
+    if age is None:
+        age = data.get("patient_age")
+    diseases = state.get("diseases") or _nonempty_text(data.get("diseases"))
+    medications = state.get("medications") or _nonempty_text(data.get("medications"))
+    if name:
+        parts.append(f"Name: {name}")
+    if age is not None:
+        parts.append(f"Age: {age}")
+    if diseases:
+        parts.append(f"Conditions: {diseases}")
+    if medications:
+        parts.append(f"Medications: {medications}")
+    if not parts:
+        return "Caller requested a human agent during intake; little context collected yet."
+    return "AI intake summary — " + "; ".join(parts) + "."
 
 
 def extract_and_validate(state: IntakeState) -> IntakeState:
@@ -94,12 +121,34 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
     diseases_valid = bool(data.get("diseases_valid")) and bool(diseases)
     medications_valid = bool(data.get("medications_valid")) and bool(medications)
 
+    handoff_requested = bool(data.get("handoff_requested"))
+    handoff_reason = _nonempty_text(data.get("handoff_reason")) or ""
+    handoff_summary = ""
+
     should_end = bool(data.get("should_end"))
-    # Caller declined to proceed — end after goodbye.
-    if ready_valid and ready is False:
+    is_complete = False
+    pending = data.get("pending_field")
+
+    if handoff_requested:
+        # Human handoff wins over continuing intake.
         should_end = True
         is_complete = False
         pending = None
+        if not handoff_reason:
+            handoff_reason = "caller requested human agent"
+        handoff_summary = _build_handoff_summary(state, data)
+        reply = _nonempty_text(data.get("reply")) or _DEFAULT_HANDOFF_REPLY
+        log.info(
+            "Handoff requested | reason=%r summary=%r",
+            handoff_reason,
+            handoff_summary,
+        )
+    elif ready_valid and ready is False:
+        # Caller declined to proceed — end after goodbye.
+        should_end = True
+        is_complete = False
+        pending = None
+        reply = str(data.get("reply") or "Could you please repeat that?")
         log.info("Caller not ready to proceed — will end call")
     else:
         is_complete = bool(
@@ -115,7 +164,6 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
             and diseases
             and medications
         )
-        pending = data.get("pending_field")
         if is_complete:
             pending = None
             should_end = True
@@ -132,10 +180,10 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
                 pending = "medications"
             else:
                 pending = None
+        reply = str(data.get("reply") or "Could you please repeat that?")
 
     messages = list(state.get("messages") or [])
     messages.append({"role": "user", "content": state["user_text"]})
-    reply = str(data.get("reply") or "Could you please repeat that?")
     messages.append({"role": "assistant", "content": reply})
 
     updated: IntakeState = {
@@ -151,13 +199,17 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         "reply": reply,
         "is_complete": is_complete,
         "should_end": should_end,
+        "handoff_requested": handoff_requested,
+        "handoff_reason": handoff_reason,
+        "handoff_summary": handoff_summary,
         "validation_notes": str(data.get("validation_notes") or ""),
     }
     log.info(
-        "extract_and_validate done | complete=%s should_end=%s pending=%s "
+        "extract_and_validate done | complete=%s should_end=%s handoff=%s pending=%s "
         "name=%r age=%r ready=%r diseases=%r meds=%r reply=%r",
         updated["is_complete"],
         updated["should_end"],
+        updated["handoff_requested"],
         updated["pending_field"],
         updated["patient_name"],
         updated["patient_age"],
@@ -171,7 +223,9 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
 
 def save_to_db(state: IntakeState) -> IntakeState:
     log.debug("NODE save_to_db | call_sid=%s", state["call_sid"])
-    if state.get("is_complete"):
+    if state.get("handoff_requested"):
+        status = "handoff_pending"
+    elif state.get("is_complete"):
         status = "complete"
     elif state.get("ready_to_proceed") is False:
         status = "not_ready"
@@ -193,6 +247,8 @@ def save_to_db(state: IntakeState) -> IntakeState:
             medications=state.get("medications"),
             transcript=transcript,
             status=status,
+            handoff_reason=state.get("handoff_reason") or None,
+            handoff_summary=state.get("handoff_summary") or None,
         )
     finally:
         db.close()
@@ -201,12 +257,18 @@ def save_to_db(state: IntakeState) -> IntakeState:
 
 
 def route_after_extract(state: IntakeState) -> Literal["save_to_db", "__end__"]:
-    # Persist whenever we end OR whenever we have any new slots mid-call.
-    if state.get("is_complete") or state.get("should_end") or state.get("patient_name"):
+    # Persist on end, handoff, or whenever we have any new slots mid-call.
+    if (
+        state.get("is_complete")
+        or state.get("should_end")
+        or state.get("handoff_requested")
+        or state.get("patient_name")
+    ):
         log.debug(
-            "Routing → save_to_db | complete=%s should_end=%s",
+            "Routing → save_to_db | complete=%s should_end=%s handoff=%s",
             state.get("is_complete"),
             state.get("should_end"),
+            state.get("handoff_requested"),
         )
         return "save_to_db"
     log.debug("Routing → END")
@@ -265,6 +327,9 @@ def run_intake_turn(
             "reply": "",
             "is_complete": False,
             "should_end": False,
+            "handoff_requested": False,
+            "handoff_reason": "",
+            "handoff_summary": "",
             "validation_notes": "",
         }
     else:
@@ -272,6 +337,9 @@ def run_intake_turn(
             **prior,
             "call_sid": call_sid,
             "user_text": user_text,
+            "handoff_requested": False,
+            "handoff_reason": "",
+            "handoff_summary": "",
         }
     result = graph.invoke(state)
     log.debug("run_intake_turn result | %s", result)

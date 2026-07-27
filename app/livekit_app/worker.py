@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.db import repository as repo
 from app.db.session import SessionLocal, init_db
 from app.logging_setup import get_logger, setup_logging
+from app.twilio_app.handoff import is_twilio_call_sid, redirect_call_to_human
 from app.voice.stt import get_stt
 from app.voice.tts import get_tts
 
@@ -415,7 +416,9 @@ async def entrypoint(ctx: JobContext) -> None:
                     db, call_sid=call_sid, line=f"assistant: {result['reply']}"
                 )
                 status = "in_progress"
-                if result.get("is_complete"):
+                if result.get("handoff_requested"):
+                    status = "handoff_pending"
+                elif result.get("is_complete"):
                     status = "complete"
                 elif result.get("ready_to_proceed") is False:
                     status = "not_ready"
@@ -429,11 +432,43 @@ async def entrypoint(ctx: JobContext) -> None:
                     medications=result.get("medications"),
                     transcript=None,
                     status=status,
+                    handoff_reason=result.get("handoff_reason") or None,
+                    handoff_summary=result.get("handoff_summary") or None,
                 )
             finally:
                 db.close()
 
             await _publish_tts_with_barge_in(ctx.room, result["reply"], mic)
+
+            if result.get("handoff_requested"):
+                log.info(
+                    "Handoff requested | call_sid=%s reason=%r",
+                    call_sid,
+                    result.get("handoff_reason"),
+                )
+                if is_twilio_call_sid(call_sid):
+                    try:
+                        await asyncio.to_thread(redirect_call_to_human, call_sid=call_sid)
+                        log.info("Twilio redirect to human queued | call_sid=%s", call_sid)
+                    except Exception:
+                        log.exception(
+                            "Failed to redirect Twilio call to human | call_sid=%s",
+                            call_sid,
+                        )
+                        await _publish_tts_with_barge_in(
+                            ctx.room,
+                            "I'm sorry, I could not reach a human agent right now. "
+                            "Please try again later.",
+                            mic,
+                        )
+                else:
+                    log.info(
+                        "Handoff flagged but not a Twilio CallSid "
+                        "(browser/debug) — ending agent only | call_sid=%s",
+                        call_sid,
+                    )
+                await asyncio.sleep(0.5)
+                break
 
             if result.get("is_complete") or result.get("should_end"):
                 log.info(

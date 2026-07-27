@@ -80,6 +80,9 @@ class DebugChatResponse(BaseModel):
     pending_field: str | None
     is_complete: bool
     should_end: bool
+    handoff_requested: bool
+    handoff_reason: str
+    handoff_summary: str
     validation_notes: str
 
 
@@ -126,7 +129,9 @@ def debug_chat(body: DebugChatRequest, db: Session = Depends(get_db)) -> DebugCh
     transcript = "\n".join(
         f"{m['role']}: {m['content']}" for m in (result.get("messages") or [])
     )
-    if result.get("is_complete"):
+    if result.get("handoff_requested"):
+        status = "handoff_pending"
+    elif result.get("is_complete"):
         status = "complete"
     elif result.get("ready_to_proceed") is False:
         status = "not_ready"
@@ -142,6 +147,8 @@ def debug_chat(body: DebugChatRequest, db: Session = Depends(get_db)) -> DebugCh
         medications=result.get("medications"),
         transcript=transcript,
         status=status,
+        handoff_reason=result.get("handoff_reason") or None,
+        handoff_summary=result.get("handoff_summary") or None,
     )
 
     return DebugChatResponse(
@@ -154,6 +161,9 @@ def debug_chat(body: DebugChatRequest, db: Session = Depends(get_db)) -> DebugCh
         pending_field=result.get("pending_field"),
         is_complete=result["is_complete"],
         should_end=result.get("should_end", False),
+        handoff_requested=bool(result.get("handoff_requested")),
+        handoff_reason=result.get("handoff_reason") or "",
+        handoff_summary=result.get("handoff_summary") or "",
         validation_notes=result.get("validation_notes") or "",
     )
 
@@ -175,6 +185,8 @@ def get_call(call_sid: str, db: Session = Depends(get_db)) -> dict[str, Any]:
         "ready_to_proceed": row.ready_to_proceed,
         "diseases": row.diseases,
         "medications": row.medications,
+        "handoff_reason": row.handoff_reason,
+        "handoff_summary": row.handoff_summary,
         "transcript": row.transcript,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
