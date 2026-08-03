@@ -1,0 +1,13 @@
+---
+alwaysApply: true
+---
+---
+description: Isolation when editing the voice intake agent
+globs: app/agent/**/*,app/livekit_app/**/*,app/twilio_app/**/*,app/voice/**
+alwaysApply: false
+---
+# Voice agent isolation
+
+When voice/telephony files are in context:
+- ONLY edit voice-related paths: `app/agent/**`, `app/livekit_app/**`, `app/twilio_app/**`, `app/voice/**`
+- Do NOT modify `app/email_agent/**`

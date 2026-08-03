@@ -1,0 +1,12 @@
+---
+description: Isolation when editing the email LangGraph agent and SES routes
+globs: app/email_agent/**/*,app/email_app/**/*
+alwaysApply: false
+---
+# Email agent isolation
+
+When files under `app/email_agent/` or `app/email_app/` are in context:
+- ONLY edit `app/email_agent/**` and `app/email_app/**`
+- Do NOT modify voice code: `app/agent/**`, `app/livekit_app/**`, `app/twilio_app/**`, `app/voice/**`
+- Shared LLM import from `app.agent.llm` is OK to *use*, not to *change*, unless explicitly asked
+- Wiring `email_router` in `app/main.py` / SES keys in `app/config.py` is allowed when adding email features

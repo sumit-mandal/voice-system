@@ -26,3 +26,4 @@ soundfile>=0.12.1
 
 httpx>=0.28.0
 python-multipart>=0.0.18
+boto3>=1.35.0

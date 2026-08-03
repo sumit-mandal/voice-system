@@ -18,6 +18,7 @@ from app.agent.state import IntakeState
 from app.config import get_settings
 from app.db.models import CallSession
 from app.db.session import get_db, init_db
+from app.email_app import router as email_router
 from app.livekit_app.browser import router as browser_router
 from app.logging_setup import get_logger, setup_logging
 from app.twilio_app.webhooks import router as twilio_router
@@ -54,6 +55,7 @@ app = FastAPI(
 )
 app.include_router(twilio_router)
 app.include_router(browser_router)
+app.include_router(email_router)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 

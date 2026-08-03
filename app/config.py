@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     tts_voice: str = "alba"
     tts_sample_rate: int = 24000
 
+    # --- AWS SES (email agent) ---
+    aws_region: str = "us-east-1"
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    # Verified SES identity used as From for auto-replies (domain or email).
+    ses_from_address: str = ""
+    # Optional: S3 bucket used by SES receipt rule for raw inbound MIME.
+    ses_inbound_bucket: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
