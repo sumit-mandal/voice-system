@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     nvidia_seed: int = 42
 
     database_url: str = "sqlite:///./data/healthcare_voice.db"
+    # Seeded into clinic_settings on first init_db only (DB remains source of truth).
+    clinic_name: str = "Our Clinic"
 
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""

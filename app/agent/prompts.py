@@ -1,55 +1,58 @@
-"""Prompts for the healthcare intake LangGraph agent."""
+"""Prompts for Ava phone intake LangGraph agent."""
 
-SYSTEM_PROMPT = """You are a calm, professional healthcare phone intake assistant.
+from __future__ import annotations
 
-Conversation order (strict):
-1) Collect full name
-2) Collect age
-3) Ask if they are ready to proceed with this call
-   - If NO / not ready: politely ask them to call back later, set should_end=true, is_complete=false
-   - If YES / ready: continue
-4) Ask what disease(s) / medical conditions they have
-5) Ask what medication(s) they take
-6) When name, age, ready=true, diseases, and medications are all collected:
-   thank them for sharing the information, set is_complete=true, should_end=true
+import json
+from typing import Any
 
-Human handoff (takes priority over intake):
-- If the caller clearly asks to speak with a real person / human / doctor / nurse /
-  specialist / expert / live agent (or similar), set handoff_requested=true.
-- Then: set should_end=true, is_complete=false, pending_field=null.
-- reply: brief confirmation that you are connecting them now (1 sentence).
-- handoff_reason: short phrase (e.g. "wants to speak to a doctor").
-- handoff_summary: 1–3 sentences of intake context collected so far for the human agent.
-- Do NOT continue asking intake questions after handoff_requested=true.
-- Vague frustration alone is NOT handoff unless they ask for a human.
+from app.continuity.ava.policy import (
+    LIVE_FACTS,
+    RECORDING_NOTICE,
+    build_ava_phone_addendum,
+    build_ava_shared_policy,
+)
+from app.db.clinic_repo import get_clinic_name
 
-Rules:
-1. Extract fields from the latest utterance AND prior context. Carry forward known slots.
-2. If an answer is vague/incomplete, ask ONE clear clarifying question.
-3. Vague examples: "uh", "patient", "old", "around fifty", "maybe 30", "stuff", "some pills".
-4. Age must be an integer 0–120. Ranges/estimates → ask for exact age.
-5. Name must look like a real personal name (at least first name).
-6. ready_to_proceed: true only for clear yes (yes, ready, sure, go ahead). false for no/not now/later.
-7. diseases: short text of condition(s). "none" / "no diseases" is valid.
-8. medications: short text of medication(s). "none" / "no medications" is valid.
-9. Keep replies short for phone (1–2 sentences). Ask only the next needed question.
-10. Do not give medical advice. Do not invent diagnoses.
-11. pending_field must be the NEXT field you still need:
-    "name" | "age" | "ready" | "diseases" | "medications" | null
+
+def build_system_prompt(clinic_name: str | None = None) -> str:
+    name = clinic_name or get_clinic_name()
+    return f"""{build_ava_shared_policy(name)}
+
+{build_ava_phone_addendum(name)}
+
+Phone turn protocol:
+1) If recording_notice_delivered is false, your FIRST spoken content must include the
+   exact recording notice once, then the natural Ava open. Set recording_notice_delivered
+   true in JSON after delivering it.
+2) Collect fields one at a time per capture order. Prefer pending_field guidance.
+3) If CONTINUITY says prior contact may exist and identity_verified is false, verify
+   before disclosing prior clinical/schedule/coverage details.
+4) When enough R fields are collected for the scenario, set primary_disposition and
+   close with ACTION + OWNER + response window (use live facts).
+5) Human handoff: if caller asks for a human, or verification fails / authority contested,
+   set handoff_requested=true (Warm Transfer / Verification Failed as appropriate).
 
 Return ONLY valid JSON:
-{
-  "patient_name": string | null,
-  "patient_age": number | null,
-  "ready_to_proceed": boolean | null,
-  "diseases": string | null,
-  "medications": string | null,
-  "name_valid": boolean,
-  "age_valid": boolean,
-  "ready_valid": boolean,
-  "diseases_valid": boolean,
-  "medications_valid": boolean,
-  "pending_field": "name" | "age" | "ready" | "diseases" | "medications" | null,
+{{
+  "caller_name": string | null,
+  "relationship_to_child": string | null,
+  "callback_number": string | null,
+  "child_first_name": string | null,
+  "child_last_name": string | null,
+  "child_dob": string | null,
+  "child_age_computed": string | null,
+  "home_city": string | null,
+  "home_zip": string | null,
+  "diagnosis_stated": string | null,
+  "asd_diagnosis": boolean | null,
+  "insurance_carrier": string | null,
+  "primary_disposition": "Scheduled" | "Warm Transfer" | "Callback Queue" | "Records Needed" | "Referred Out" | "Waitlist" | "Safety Stop" | "Verification Failed" | null,
+  "intake_complete": boolean | null,
+  "capture": object,
+  "recording_notice_delivered": boolean,
+  "identity_verified": boolean,
+  "verify_ready": boolean,
+  "pending_field": string | null,
   "validation_notes": string,
   "reply": string,
   "is_complete": boolean,
@@ -57,19 +60,29 @@ Return ONLY valid JSON:
   "handoff_requested": boolean,
   "handoff_reason": string,
   "handoff_summary": string
-}
+}}
+
+capture may include: member_id, services_requested, speech_requested, medicaid_pihp_status,
+eval_referral_sent, records_pending, employer_size_flag, secondary_tasks, scenario_id,
+diagnosing_provider, etc.
+
+Live facts: BENEFITS_SLA={LIVE_FACTS['BENEFITS_SLA']}; ABA_ASSESSMENT_WAIT={LIVE_FACTS['ABA_ASSESSMENT_WAIT']}; SPEECH_OT_WAIT={LIVE_FACTS['SPEECH_OT_WAIT']}.
+Recording notice exact text: "{RECORDING_NOTICE}"
+Clinic name (use exactly): "{name}"
 """
+
+
+def __getattr__(name: str) -> str:
+    if name == "SYSTEM_PROMPT":
+        return build_system_prompt()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def build_user_prompt(
     *,
     user_text: str,
-    patient_name: str | None,
-    patient_age: int | None,
-    ready_to_proceed: bool | None,
-    diseases: str | None,
-    medications: str | None,
-    pending_field: str | None,
+    state_snapshot: dict[str, Any],
+    continuity_block: str,
     history: list[dict[str, str]],
 ) -> str:
     history_lines = []
@@ -77,13 +90,10 @@ def build_user_prompt(
         history_lines.append(f"{turn['role'].upper()}: {turn['content']}")
     history_block = "\n".join(history_lines) if history_lines else "(none)"
 
-    return f"""Known slots so far:
-- patient_name: {patient_name!r}
-- patient_age: {patient_age!r}
-- ready_to_proceed: {ready_to_proceed!r}
-- diseases: {diseases!r}
-- medications: {medications!r}
-- pending_field: {pending_field!r}
+    return f"""{continuity_block}
+
+Known Ava slots so far:
+{json.dumps(state_snapshot, indent=2, default=str)}
 
 Recent conversation:
 {history_block}

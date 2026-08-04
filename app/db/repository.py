@@ -16,23 +16,41 @@ def create_call_session(
     call_sid: str,
     room_name: str,
     caller_number: str | None,
+    user_id: str | None = None,
 ) -> CallSession:
     log.debug(
-        "DB create_call_session | call_sid=%s room=%s caller=%s",
+        "DB create_call_session | call_sid=%s room=%s caller=%s user_id=%s",
         call_sid,
         room_name,
         caller_number,
+        user_id,
     )
     row = CallSession(
         call_sid=call_sid,
         room_name=room_name,
         caller_number=caller_number,
+        user_id=user_id,
         status="in_progress",
     )
     db.add(row)
     db.commit()
     db.refresh(row)
-    log.info("Created call_session id=%s call_sid=%s", row.id, row.call_sid)
+    log.info(
+        "Created call_session id=%s call_sid=%s user_id=%s",
+        row.id,
+        row.call_sid,
+        row.user_id,
+    )
+    return row
+
+
+def set_call_user_id(db: Session, *, call_sid: str, user_id: str) -> CallSession:
+    row = get_by_call_sid(db, call_sid)
+    if row is None:
+        raise ValueError(f"No call_session for call_sid={call_sid}")
+    row.user_id = user_id
+    db.commit()
+    db.refresh(row)
     return row
 
 

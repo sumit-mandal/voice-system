@@ -49,7 +49,18 @@ def init_db() -> None:
     log.debug("Creating DB tables if missing | url=%s", settings.database_url)
     Base.metadata.create_all(bind=engine)
     _migrate_sqlite_columns()
+    _seed_clinic_settings()
     log.info("DB ready")
+
+
+def _seed_clinic_settings() -> None:
+    from app.db.clinic_repo import ensure_clinic_settings
+
+    db = SessionLocal()
+    try:
+        ensure_clinic_settings(db, default_name=settings.clinic_name or None)
+    finally:
+        db.close()
 
 
 def _migrate_sqlite_columns() -> None:
@@ -62,6 +73,7 @@ def _migrate_sqlite_columns() -> None:
         "medications": "TEXT",
         "handoff_reason": "VARCHAR(256)",
         "handoff_summary": "TEXT",
+        "user_id": "VARCHAR(36)",
     }
     with engine.begin() as conn:
         rows = conn.exec_driver_sql("PRAGMA table_info(call_sessions)").fetchall()

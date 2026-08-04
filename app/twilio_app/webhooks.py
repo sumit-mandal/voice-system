@@ -11,6 +11,7 @@ from twilio.rest import Client
 from twilio.twiml.voice_response import Dial, VoiceResponse
 
 from app.config import get_settings
+from app.db import continuity_repo as crepo
 from app.db import repository as repo
 from app.db.session import SessionLocal
 from app.livekit_app.rooms import create_room, dispatch_agent, make_room_name
@@ -138,13 +139,17 @@ async def _bridge_to_livekit(
     room_name = make_room_name(call_sid)
     await create_room(room_name)
 
+    user_id: str | None = None
     db = SessionLocal()
     try:
+        user = crepo.find_or_create_user_by_phone(db, party_number or None)
+        user_id = user.id if user else None
         repo.create_call_session(
             db,
             call_sid=call_sid,
             room_name=room_name,
             caller_number=party_number or None,
+            user_id=user_id,
         )
     finally:
         db.close()
@@ -155,6 +160,7 @@ async def _bridge_to_livekit(
             "from": from_number,
             "to": to_number,
             "direction": direction,
+            "user_id": user_id,
         }
     )
     await dispatch_agent(room_name, metadata)

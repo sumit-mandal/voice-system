@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.db import continuity_repo as crepo
 from app.db import repository as repo
 from app.db.session import get_db
 from app.livekit_app.rooms import (
@@ -34,20 +35,33 @@ class BrowserSessionResponse(BaseModel):
     identity: str
 
 
+class BrowserSessionRequest(BaseModel):
+    phone: str | None = None
+
+
 @router.post("/session", response_model=BrowserSessionResponse)
-async def start_browser_session(db: Session = Depends(get_db)) -> BrowserSessionResponse:
+async def start_browser_session(
+    body: BrowserSessionRequest | None = None,
+    db: Session = Depends(get_db),
+) -> BrowserSessionResponse:
     """Create a LiveKit room, DB row, mint browser token, dispatch agent."""
     settings = get_settings()
     call_sid = f"browser-{uuid.uuid4().hex[:12]}"
     room_name = make_room_name(call_sid)
     identity = f"browser-user-{uuid.uuid4().hex[:8]}"
-    metadata = json.dumps({"call_sid": call_sid, "source": "browser"})
+    phone = (body.phone if body else None) or "browser"
+    user = crepo.find_or_create_user_by_phone(db, phone if phone != "browser" else None)
+    user_id = user.id if user else None
+    metadata = json.dumps(
+        {"call_sid": call_sid, "source": "browser", "user_id": user_id}
+    )
 
     log.info(
-        "Browser session start | call_sid=%s room=%s identity=%s",
+        "Browser session start | call_sid=%s room=%s identity=%s user_id=%s",
         call_sid,
         room_name,
         identity,
+        user_id,
     )
 
     await create_room_with_agent(room_name, metadata=metadata)
@@ -55,7 +69,8 @@ async def start_browser_session(db: Session = Depends(get_db)) -> BrowserSession
         db,
         call_sid=call_sid,
         room_name=room_name,
-        caller_number="browser",
+        caller_number=phone,
+        user_id=user_id,
     )
     token = create_participant_token(
         room_name=room_name,

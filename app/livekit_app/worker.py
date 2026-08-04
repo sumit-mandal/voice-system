@@ -13,22 +13,20 @@ import numpy as np
 from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 
-from app.agent.graph import run_intake_turn
+from app.agent.graph import run_intake_turn, seed_prior_after_greeting
 from app.agent.state import IntakeState
 from app.config import get_settings
 from app.db import repository as repo
+from app.db.clinic_repo import get_clinic_name
 from app.db.session import SessionLocal, init_db
 from app.logging_setup import get_logger, setup_logging
 from app.twilio_app.handoff import is_twilio_call_sid, redirect_call_to_human
 from app.voice.stt import get_stt
 from app.voice.tts import get_tts
+from app.continuity.ava.policy import phone_greeting
 
 log = get_logger(__name__)
 
-GREETING = (
-    "Hello, thank you for calling. I'm the intake assistant. "
-    "May I have your full name and age, please?"
-)
 SILENCE_SECONDS = 1.2 #After 1.2 seconds of silence, the system assumes the user has finished speaking
 MAX_UTTERANCE_SECONDS = 12.0 #The system will stop recording after 12 seconds of speech
 MIN_UTTERANCE_SECONDS = 0.45 #The system will not consider the speech to be valid if it is less than 0.45 seconds
@@ -365,14 +363,15 @@ async def entrypoint(ctx: JobContext) -> None:
     log.debug("AudioStream + MicPump attached (barge-in enabled)")
 
     try:
-        await _publish_tts_with_barge_in(ctx.room, GREETING, mic)
+        greeting = phone_greeting(get_clinic_name())
+        await _publish_tts_with_barge_in(ctx.room, greeting, mic)
         db = SessionLocal()
         try:
-            repo.append_transcript(db, call_sid=call_sid, line=f"assistant: {GREETING}")
+            repo.append_transcript(db, call_sid=call_sid, line=f"assistant: {greeting}")
         finally:
             db.close()
 
-        prior: IntakeState | None = None
+        prior: IntakeState | None = seed_prior_after_greeting(call_sid)
         stt = get_stt()
 
         while True:

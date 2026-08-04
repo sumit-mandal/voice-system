@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.agent.graph import run_intake_turn
 from app.agent.state import IntakeState
 from app.config import get_settings
+from app.db import continuity_repo as crepo
 from app.db.models import CallSession
 from app.db.session import get_db, init_db
 from app.email_app import router as email_router
@@ -70,10 +71,19 @@ class DebugChatRequest(BaseModel):
     call_sid: str = Field(..., description="Synthetic or real CallSid key")
     text: str = Field(..., min_length=1)
     reset: bool = False
+    phone: str | None = Field(
+        default=None,
+        description="Optional E.164 phone to link/create shared user UUID for continuity tests",
+    )
 
 
 class DebugChatResponse(BaseModel):
     reply: str
+    user_id: str | None = None
+    identity_verified: bool = False
+    primary_disposition: str | None = None
+    caller_name: str | None = None
+    child_first_name: str | None = None
     patient_name: str | None
     patient_age: int | None
     ready_to_proceed: bool | None
@@ -110,16 +120,26 @@ def debug_chat(body: DebugChatRequest, db: Session = Depends(get_db)) -> DebugCh
 
     # Ensure a DB row exists for debug sessions.
     existing = db.query(CallSession).filter(CallSession.call_sid == body.call_sid).one_or_none()
+    user_id = existing.user_id if existing else None
+    if body.phone:
+        user = crepo.find_or_create_user_by_phone(db, body.phone)
+        user_id = user.id if user else user_id
     if existing is None:
         log.debug("Creating debug CallSession row | call_sid=%s", body.call_sid)
         db.add(
             CallSession(
                 call_sid=body.call_sid,
                 room_name=f"debug-{body.call_sid}",
-                caller_number="debug",
+                caller_number=body.phone or "debug",
+                user_id=user_id,
                 status="in_progress",
             )
         )
+        db.commit()
+    elif user_id and existing.user_id != user_id:
+        existing.user_id = user_id
+        if body.phone:
+            existing.caller_number = body.phone
         db.commit()
 
     prior = None if body.reset else _DEBUG_STATE.get(body.call_sid)
@@ -135,18 +155,16 @@ def debug_chat(body: DebugChatRequest, db: Session = Depends(get_db)) -> DebugCh
         status = "handoff_pending"
     elif result.get("is_complete"):
         status = "complete"
-    elif result.get("ready_to_proceed") is False:
-        status = "not_ready"
     else:
         status = "in_progress"
     repo.update_intake(
         db,
         call_sid=body.call_sid,
-        patient_name=result.get("patient_name"),
+        patient_name=result.get("patient_name") or result.get("caller_name"),
         patient_age=result.get("patient_age"),
         ready_to_proceed=result.get("ready_to_proceed"),
-        diseases=result.get("diseases"),
-        medications=result.get("medications"),
+        diseases=result.get("diseases") or result.get("diagnosis_stated"),
+        medications=result.get("medications") or result.get("insurance_carrier"),
         transcript=transcript,
         status=status,
         handoff_reason=result.get("handoff_reason") or None,
@@ -155,6 +173,11 @@ def debug_chat(body: DebugChatRequest, db: Session = Depends(get_db)) -> DebugCh
 
     return DebugChatResponse(
         reply=result["reply"],
+        user_id=result.get("user_id"),
+        identity_verified=bool(result.get("identity_verified")),
+        primary_disposition=result.get("primary_disposition"),
+        caller_name=result.get("caller_name"),
+        child_first_name=result.get("child_first_name"),
         patient_name=result.get("patient_name"),
         patient_age=result.get("patient_age"),
         ready_to_proceed=result.get("ready_to_proceed"),
@@ -181,6 +204,7 @@ def get_call(call_sid: str, db: Session = Depends(get_db)) -> dict[str, Any]:
         "call_sid": row.call_sid,
         "room_name": row.room_name,
         "caller_number": row.caller_number,
+        "user_id": row.user_id,
         "status": row.status,
         "patient_name": row.patient_name,
         "patient_age": row.patient_age,
