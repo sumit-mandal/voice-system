@@ -27,19 +27,21 @@ def _ensure_sqlite_parent(url: str) -> None:
 settings = get_settings()
 _ensure_sqlite_parent(settings.database_url)
 
+_IS_SQLITE = settings.database_url.startswith("sqlite:///")
+
 engine = create_engine(
     settings.database_url,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False} if _IS_SQLITE else {},
     echo=settings.log_level.upper() == "DEBUG",
 )
 
-
-@event.listens_for(engine, "connect")
-def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
-    log.debug("SQLite connection opened; foreign_keys=ON")
+if _IS_SQLITE:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+        log.debug("SQLite connection opened; foreign_keys=ON")
 
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
