@@ -11,6 +11,7 @@ from langgraph.graph import END, StateGraph
 from app.agent.llm import chat_completion
 from app.agent.prompts import build_system_prompt, build_user_prompt
 from app.agent.state import IntakeState
+from app.continuity.ava.policy import LIVE_FACTS
 from app.continuity.context import (
     is_verified,
     persist_channel_turn,
@@ -38,6 +39,50 @@ _DISPOSITIONS = {
     "Waitlist",
     "Safety Stop",
     "Verification Failed",
+}
+_MAX_UNCLEAR = 1  # after one unclear retry, skip field
+_MAX_TURNS = 40  # emergency cap only; normal completion follows the full checklist
+_FIELD_SKIP_ORDER = [
+    "caller_name",
+    "relationship",
+    "callback",
+    "best_callback_time",
+    "child_name",
+    "child_dob",
+    "location",
+    "language",
+    "diagnosis",
+    "diagnosing_provider",
+    "insurance",
+    "insurance_plan",
+    "member_id",
+    "services",
+    "availability",
+    "consent",
+    "additional_notes",
+    "close",
+]
+
+_FIELD_PROMPTS = {
+    "caller_name": "Could I please get your first and last name?",
+    "relationship": "What is your relationship to the child?",
+    "callback": "What is the best callback number for you?",
+    "best_callback_time": "What is the best time of day for our team to call you?",
+    "child_name": "Could I get the child's first and last name?",
+    "child_dob": "What is the child's date of birth?",
+    "location": "What city and ZIP code does the child live in?",
+    "language": "What language do you prefer for calls, and do you need an interpreter?",
+    "diagnosis": "What diagnosis has the child received?",
+    "diagnosing_provider": "Who provided the diagnosis, and about when was it made?",
+    "insurance": "Who is the primary insurance carrier?",
+    "insurance_plan": "What is the insurance plan or product name, if you know it?",
+    "member_id": "What is the member ID and subscriber name?",
+    "services": "Which services are you looking for, such as ABA, speech, or OT?",
+    "availability": "What days or times and care setting work best for your family?",
+    "consent": (
+        "May we contact you at this number about intake, and what contact method is safest?"
+    ),
+    "additional_notes": "Before we finish, is there anything else you want the care team to know?",
 }
 
 
@@ -116,6 +161,106 @@ def _build_handoff_summary(state: IntakeState, data: dict[str, Any]) -> str:
         return "Caller requested a human during Ava intake; little context collected yet."
     return "Ava intake summary — " + "; ".join(parts) + "."
 
+
+def _field_is_collected(
+    field: str,
+    *,
+    caller_name: str | None,
+    relationship: str | None,
+    callback: str | None,
+    child_first: str | None,
+    child_last: str | None,
+    child_dob: str | None,
+    home_city: str | None,
+    home_zip: str | None,
+    diagnosis: str | None,
+    carrier: str | None,
+    capture: dict[str, Any],
+) -> bool:
+    """Return whether a checklist field was answered or explicitly unavailable."""
+    skipped = set(capture.get("skipped_fields") or [])
+    if field in skipped:
+        return True
+    values = {
+        "caller_name": bool(caller_name),
+        "relationship": bool(relationship),
+        "callback": bool(callback),
+        "best_callback_time": bool(capture.get("best_callback_time")),
+        "child_name": bool(child_first and child_last),
+        "child_dob": bool(child_dob),
+        "location": bool(home_city and home_zip),
+        "language": bool(capture.get("preferred_language"))
+        and "interpreter_needed" in capture,
+        "diagnosis": bool(diagnosis),
+        "diagnosing_provider": bool(
+            capture.get("diagnosing_provider") and capture.get("diagnosis_date")
+        ),
+        "insurance": bool(carrier),
+        "insurance_plan": bool(capture.get("insurance_plan")),
+        "member_id": bool(
+            capture.get("member_id") and capture.get("subscriber_name")
+        ),
+        "services": bool(capture.get("services_requested")),
+        "availability": bool(
+            capture.get("availability") and capture.get("care_setting")
+        ),
+        "consent": "contact_consent" in capture
+        and (
+            capture.get("contact_consent") is False
+            or bool(capture.get("safe_contact_method"))
+        ),
+        "additional_notes": "additional_notes" in capture,
+    }
+    return values.get(field, False)
+
+
+def _next_required_field(**details: Any) -> str:
+    for field in _FIELD_SKIP_ORDER:
+        if field == "close":
+            return "close"
+        if not _field_is_collected(field, **details):
+            return field
+    return "close"
+
+
+def _graceful_close_reply(*, caller_name: str | None, child_first: str | None) -> str:
+    who = child_first or "your child"
+    thanks = f"Thanks{', ' + caller_name if caller_name else ''}."
+    return (
+        f"{thanks} Here's what happens next. Our benefits team reviews coverage "
+        f"for {who}, and someone calls you back within {LIVE_FACTS['BENEFITS_SLA']}. "
+        "I've saved the intake details for the care team. Thank you, and goodbye."
+    )
+
+
+def _is_repeat_ask(reply: str) -> bool:
+    low = reply.lower()
+    return any(
+        p in low
+        for p in (
+            "didn't quite catch",
+            "did not catch",
+            "could you please repeat",
+            "can you repeat",
+            "say that again",
+            "could you repeat",
+            "i didn't catch",
+            "i could not understand",
+            "please repeat",
+        )
+    )
+
+
+def _next_field_after(pending: str | None) -> str | None:
+    if not pending:
+        return "close"
+    try:
+        idx = _FIELD_SKIP_ORDER.index(pending)
+    except ValueError:
+        return "close"
+    if idx + 1 >= len(_FIELD_SKIP_ORDER):
+        return None
+    return _FIELD_SKIP_ORDER[idx + 1]
 
 def _apply_verification(state: IntakeState, data: dict[str, Any]) -> tuple[bool, str, str | None]:
     """Return (verified, continuity_block, possibly_updated_user_id)."""
@@ -205,13 +350,41 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         continuity_block=state.get("continuity_block") or "",
         history=state.get("messages") or [],
     )
-    raw = chat_completion(
-        [
-            {"role": "system", "content": build_system_prompt()},
-            {"role": "user", "content": user_prompt},
-        ]
-    )
-    data = _parse_llm_json(raw)
+    try:
+        raw = chat_completion(
+            [
+                {"role": "system", "content": build_system_prompt()},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+        data = _parse_llm_json(raw)
+    except Exception:
+        # Never stall on LLM/STT garbage — skip current field and keep moving
+        log.exception("LLM extract failed — advancing with safe defaults")
+        next_field = _next_field_after(state.get("pending_field"))
+        skipped_fields = list((state.get("capture") or {}).get("skipped_fields") or [])
+        current_field = state.get("pending_field")
+        if current_field and current_field not in {"recording_notice", "close"}:
+            skipped_fields.append(current_field)
+        if next_field in (None, "close"):
+            data = {
+                "reply": "",
+                "pending_field": None,
+                "capture": {"skipped_fields": skipped_fields},
+                "primary_disposition": "Callback Queue",
+                "is_complete": True,
+                "should_end": True,
+                "handoff_requested": False,
+            }
+        else:
+            data = {
+                "reply": "",
+                "pending_field": next_field,
+                "capture": {"skipped_fields": skipped_fields},
+                "is_complete": False,
+                "should_end": False,
+                "handoff_requested": False,
+            }
 
     verified, continuity_block, resolved_user_id = _apply_verification(state, data)
 
@@ -235,6 +408,49 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
     if asd is None:
         asd = state.get("asd_diagnosis")
     carrier = _nonempty_text(pick("insurance_carrier"))
+
+    # If model blanked insurance but caller just answered an insurance ask, accept utterance.
+    # Prefer explicit pending_field from the model (including null = done) over prior state.
+    if "pending_field" in data:
+        pending_in = data.get("pending_field")
+    else:
+        pending_in = state.get("pending_field")
+    user_utt = (state.get("user_text") or "").strip()
+    if not carrier and pending_in == "insurance" and user_utt:
+        # Avoid accepting meta-answers like "what?" / pure fillers
+        low = user_utt.lower()
+        if low not in {"what", "huh", "sorry", "repeat", "pardon"} and len(user_utt) >= 2:
+            carrier = user_utt.rstrip(".")
+
+    # Guard: do not overwrite adult caller_name with the child's name.
+    prior_caller = state.get("caller_name")
+    if (
+        caller_name
+        and child_first
+        and caller_name.strip().lower() == child_first.strip().lower()
+        and prior_caller
+        and prior_caller.strip().lower() != child_first.strip().lower()
+    ):
+        log.warning(
+            "Rejected caller_name==child_first_name mixup | kept caller=%r child=%r",
+            prior_caller,
+            child_first,
+        )
+        caller_name = prior_caller
+    if (
+        caller_name
+        and child_first
+        and caller_name.strip().lower() == child_first.strip().lower()
+        and relationship
+        and relationship.strip().lower()
+        not in {"self", "myself", "patient", "me"}
+    ):
+        # Relative calling: prefer keeping prior caller if any, else clear mistaken overwrite
+        if prior_caller and prior_caller.strip().lower() != child_first.strip().lower():
+            caller_name = prior_caller
+        elif state.get("caller_name"):
+            caller_name = state.get("caller_name")
+
     disposition = _nonempty_text(data.get("primary_disposition")) or state.get(
         "primary_disposition"
     )
@@ -245,6 +461,19 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         intake_complete = state.get("intake_complete")
 
     capture = _merge_capture(state.get("capture") or {}, data.get("capture"))
+    checklist_details = {
+        "caller_name": caller_name,
+        "relationship": relationship,
+        "callback": callback,
+        "child_first": child_first,
+        "child_last": child_last,
+        "child_dob": child_dob,
+        "home_city": home_city,
+        "home_zip": home_zip,
+        "diagnosis": diagnosis,
+        "carrier": carrier,
+        "capture": capture,
+    }
     recording_notice = bool(
         data.get("recording_notice_delivered")
         or state.get("recording_notice_delivered")
@@ -256,11 +485,15 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
     should_end = bool(data.get("should_end"))
     is_complete = False
     pending = data.get("pending_field")
+    turn_count = int(state.get("turn_count") or 0) + 1
+    unclear_streak = int(state.get("unclear_streak") or 0)
+    prior_pending = state.get("pending_field")
 
     if handoff_requested:
         should_end = True
         is_complete = False
         pending = None
+        unclear_streak = 0
         if not handoff_reason:
             handoff_reason = "caller requested human agent"
         if not disposition:
@@ -268,13 +501,99 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         handoff_summary = _build_handoff_summary(state, data)
         reply = _nonempty_text(data.get("reply")) or _DEFAULT_HANDOFF_REPLY
     else:
-        is_complete = bool(data.get("is_complete") and disposition)
-        if is_complete:
-            pending = None
+        reply = str(data.get("reply") or "")
+        is_repeat_ask = _is_repeat_ask(reply) if reply else False
+
+        # Track unclear retries on the same pending field
+        if is_repeat_ask and pending_in and pending_in == prior_pending:
+            unclear_streak += 1
+        elif pending_in != prior_pending:
+            unclear_streak = 0
+
+        # After one unclear retry, skip the field and move on
+        if unclear_streak > _MAX_UNCLEAR and pending_in not in {None, "close"}:
+            skipped = pending_in
+            skipped_fields = list(capture.get("skipped_fields") or [])
+            if skipped not in skipped_fields:
+                skipped_fields.append(skipped)
+            capture["skipped_fields"] = skipped_fields
+            pending = _next_required_field(**checklist_details)
+            unclear_streak = 0
+            log.info("Skipping unclear field | skipped=%s next=%s", skipped, pending)
+            if pending == "close" or pending is None:
+                disposition = disposition or "Callback Queue"
+                is_complete = True
+                should_end = True
+                reply = _graceful_close_reply(
+                    caller_name=caller_name, child_first=child_first
+                )
+            else:
+                reply = (
+                    "No problem, we'll leave that for the care team to confirm. "
+                    + _FIELD_PROMPTS.get(
+                        str(pending),
+                        "Let's keep going. What else should I capture for intake?",
+                    )
+                )
+
+        # Accept insurance answers without re-asking, then continue the checklist.
+        elif carrier and (
+            pending_in == "insurance"
+            or (is_repeat_ask and prior_pending == "insurance")
+        ):
+            unclear_streak = 0
+            pending = _next_required_field(**checklist_details)
+            if pending == "close":
+                disposition = disposition or "Callback Queue"
+                is_complete = True
+                should_end = True
+                pending = None
+                reply = _graceful_close_reply(
+                    caller_name=caller_name, child_first=child_first
+                )
+            else:
+                reply = f"Got it — {carrier}. " + _FIELD_PROMPTS[pending]
+
+        else:
+            # A normal close is allowed only after every checklist field was handled.
+            model_complete = bool(data.get("is_complete") and disposition)
+            next_required = _next_required_field(**checklist_details)
+            checklist_complete = next_required == "close"
+            if checklist_complete:
+                disposition = disposition or "Callback Queue"
+                is_complete = True
+                should_end = True
+                pending = None
+                unclear_streak = 0
+                if intake_complete is None:
+                    intake_complete = True
+                reply = _graceful_close_reply(
+                    caller_name=caller_name, child_first=child_first
+                )
+            else:
+                # Override premature model closure and keep the interview flowing.
+                should_end = False
+                is_complete = False
+                disposition = None
+                pending = next_required
+                if (
+                    not reply
+                    or data.get("should_end")
+                    or data.get("is_complete")
+                    or pending_in != next_required
+                ):
+                    reply = _FIELD_PROMPTS[next_required]
+
+        # Hard turn cap — never leave a call hanging
+        if not should_end and turn_count >= _MAX_TURNS:
+            disposition = disposition or "Callback Queue"
+            is_complete = True
             should_end = True
-            if intake_complete is None:
-                intake_complete = True
-        reply = str(data.get("reply") or "Could you please repeat that?")
+            pending = None
+            reply = _graceful_close_reply(
+                caller_name=caller_name, child_first=child_first
+            )
+            log.info("Force-close on turn cap | turn_count=%s", turn_count)
 
     messages = list(state.get("messages") or [])
     messages.append({"role": "user", "content": state["user_text"]})
@@ -310,6 +629,8 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         "intake_complete": intake_complete if isinstance(intake_complete, bool) else None,
         "capture": capture,
         "pending_field": pending,  # type: ignore[typeddict-item]
+        "unclear_streak": unclear_streak,
+        "turn_count": turn_count,
         "reply": reply,
         "is_complete": is_complete,
         "should_end": should_end,
@@ -521,6 +842,8 @@ def _initial_state(call_sid: str, user_text: str) -> IntakeState:
         "intake_complete": None,
         "capture": {},
         "pending_field": "recording_notice",
+        "unclear_streak": 0,
+        "turn_count": 0,
         "reply": "",
         "is_complete": False,
         "should_end": False,
@@ -536,12 +859,16 @@ def _initial_state(call_sid: str, user_text: str) -> IntakeState:
     }
 
 
-def seed_prior_after_greeting(call_sid: str) -> IntakeState:
+def seed_prior_after_greeting(
+    call_sid: str, greeting: str | None = None
+) -> IntakeState:
     """Seed state after the Ava opening greeting (recording notice already spoken)."""
     state = _initial_state(call_sid, user_text="")
     state["recording_notice_delivered"] = True
     state["pending_field"] = "caller_name"
-    state["messages"] = [{"role": "assistant", "content": "greeting"}]
+    state["messages"] = [
+        {"role": "assistant", "content": greeting or "How may I help with intake today?"}
+    ]
     return state
 
 

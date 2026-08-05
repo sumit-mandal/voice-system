@@ -15,7 +15,9 @@ services:
 
   livekit:
     image: livekit/livekit-server:latest
-    # Advertise the EC2 public IP so browser WebRTC ICE works remotely.
+    # EC2 telephony: advertise public IP for WebRTC ICE.
+    # Local browser: docker-compose.override.yml (gitignored) overrides to 127.0.0.1.
+    # Pushing this file does not require EC2 env or rebuild changes.
     command: --dev --bind 0.0.0.0 --redis-host redis:6379 --node-ip 54.198.15.14
     ports:
       - "7880:7880" # WebSocket / HTTP

@@ -8,15 +8,22 @@ PendingField = Literal[
     "recording_notice",
     "caller_name",
     "relationship",
+    "callback",
+    "best_callback_time",
     "child_name",
     "child_dob",
     "verify_identity",
-    "diagnosis",
-    "insurance",
     "location",
-    "callback",
+    "language",
+    "diagnosis",
+    "diagnosing_provider",
+    "insurance",
+    "insurance_plan",
+    "member_id",
     "services",
+    "availability",
     "consent",
+    "additional_notes",
     "close",
     None,
 ]
@@ -59,6 +66,10 @@ class IntakeState(TypedDict):
     intake_complete: bool | None
     capture: dict[str, Any]
     pending_field: PendingField | None
+    # How many times we've asked to clarify the current pending field
+    unclear_streak: int
+    # User turns processed this call (for hard turn cap)
+    turn_count: int
     # Dialogue control
     reply: str
     is_complete: bool

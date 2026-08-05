@@ -39,6 +39,15 @@ PARTICIPANT_WAIT_SECONDS = 60.0
 TRACK_WAIT_SECONDS = 45.0
 
 
+def _save_transcript_line(call_sid: str, line: str) -> None:
+    """Persist one STT/TTS line so the browser UI can poll the live conversation."""
+    db = SessionLocal()
+    try:
+        repo.append_transcript(db, call_sid=call_sid, line=line)
+    finally:
+        db.close()
+
+
 def _pcm16_rms(frame: bytes) -> float:
     if len(frame) < 2:
         return 0.0
@@ -365,62 +374,118 @@ async def entrypoint(ctx: JobContext) -> None:
     try:
         greeting = phone_greeting(get_clinic_name())
         await _publish_tts_with_barge_in(ctx.room, greeting, mic)
-        db = SessionLocal()
-        try:
-            repo.append_transcript(db, call_sid=call_sid, line=f"assistant: {greeting}")
-        finally:
-            db.close()
+        _save_transcript_line(call_sid, f"assistant: {greeting}")
 
-        prior: IntakeState | None = seed_prior_after_greeting(call_sid)
+        prior: IntakeState | None = seed_prior_after_greeting(call_sid, greeting)
         stt = get_stt()
+        empty_stt_streak = 0
+        max_empty_stt = 3
 
         while True:
+            # Capture already caps at MAX_UTTERANCE_SECONDS — never hangs forever
             pcm = await _capture_utterance(mic)
             if not pcm:
-                log.debug("No speech captured — prompting again")
-                await _publish_tts_with_barge_in(
-                    ctx.room,
-                    "Sorry, I did not catch that. Please continue.",
-                    mic,
-                )
+                empty_stt_streak += 1
+                log.debug("No speech captured | empty_stt_streak=%s", empty_stt_streak)
+                if empty_stt_streak >= max_empty_stt:
+                    bye = (
+                        "I'll wrap up for now. Our team will follow up if we have "
+                        "what we need. Goodbye."
+                    )
+                    _save_transcript_line(call_sid, f"assistant: {bye}")
+                    await _publish_tts_with_barge_in(ctx.room, bye, mic)
+                    break
+                nudge = "Sorry, I did not catch that. Please continue."
+                _save_transcript_line(call_sid, f"assistant: {nudge}")
+                await _publish_tts_with_barge_in(ctx.room, nudge, mic)
                 continue
 
-            transcript = await asyncio.to_thread(stt.transcribe_pcm16, pcm, sample_rate=16000)
+            try:
+                transcript = await asyncio.wait_for(
+                    asyncio.to_thread(stt.transcribe_pcm16, pcm, sample_rate=16000),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                log.warning("STT timed out")
+                empty_stt_streak += 1
+                if empty_stt_streak >= max_empty_stt:
+                    bye = (
+                        "I'm having trouble hearing you, so I'll end this call for now. "
+                        "Please call back when you can. Goodbye."
+                    )
+                    _save_transcript_line(call_sid, f"assistant: {bye}")
+                    await _publish_tts_with_barge_in(ctx.room, bye, mic)
+                    break
+                nudge = "I could not understand. Let's move on — please continue."
+                _save_transcript_line(call_sid, f"assistant: {nudge}")
+                await _publish_tts_with_barge_in(ctx.room, nudge, mic)
+                continue
+
             if not transcript.text:
                 log.warning("STT returned empty text")
-                await _publish_tts_with_barge_in(
-                    ctx.room,
-                    "I could not understand. Could you please repeat?",
-                    mic,
-                )
+                empty_stt_streak += 1
+                if empty_stt_streak >= max_empty_stt:
+                    bye = "I'll wrap up for now. Please call back anytime. Goodbye."
+                    _save_transcript_line(call_sid, f"assistant: {bye}")
+                    await _publish_tts_with_barge_in(ctx.room, bye, mic)
+                    break
+                nudge = "I could not understand. Please continue with the next detail."
+                _save_transcript_line(call_sid, f"assistant: {nudge}")
+                await _publish_tts_with_barge_in(ctx.room, nudge, mic)
                 continue
 
-            db = SessionLocal()
-            try:
-                repo.append_transcript(db, call_sid=call_sid, line=f"user: {transcript.text}")
-            finally:
-                db.close()
+            empty_stt_streak = 0
+            _save_transcript_line(call_sid, f"user: {transcript.text}")
 
-            result = await asyncio.to_thread(
-                run_intake_turn,
-                call_sid=call_sid,
-                user_text=transcript.text,
-                prior=prior,
-            )
-            prior = result
-
-            db = SessionLocal()
             try:
-                repo.append_transcript(
-                    db, call_sid=call_sid, line=f"assistant: {result['reply']}"
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        run_intake_turn,
+                        call_sid=call_sid,
+                        user_text=transcript.text,
+                        prior=prior,
+                    ),
+                    timeout=45.0,
                 )
+            except asyncio.TimeoutError:
+                log.exception("Intake turn timed out — forcing graceful close")
+                result = {
+                    **(prior or {}),
+                    "reply": (
+                        "Thanks. I'll have our team follow up within one business day. "
+                        "Goodbye."
+                    ),
+                    "is_complete": True,
+                    "should_end": True,
+                    "primary_disposition": "Callback Queue",
+                    "handoff_requested": False,
+                }
+            except Exception:
+                log.exception("Intake turn failed — forcing graceful close")
+                result = {
+                    **(prior or {}),
+                    "reply": (
+                        "Thanks for the information. Someone from our team will follow up. "
+                        "Goodbye."
+                    ),
+                    "is_complete": True,
+                    "should_end": True,
+                    "primary_disposition": "Callback Queue",
+                    "handoff_requested": False,
+                }
+
+            prior = result  # type: ignore[assignment]
+            reply_text = (result.get("reply") or "").strip() or (
+                "Thanks. Our team will follow up. Goodbye."
+            )
+
+            db = SessionLocal()
+            try:
                 status = "in_progress"
                 if result.get("handoff_requested"):
                     status = "handoff_pending"
-                elif result.get("is_complete"):
+                elif result.get("is_complete") or result.get("should_end"):
                     status = "complete"
-                elif result.get("ready_to_proceed") is False:
-                    status = "not_ready"
                 repo.update_intake(
                     db,
                     call_sid=call_sid,
@@ -437,7 +502,17 @@ async def entrypoint(ctx: JobContext) -> None:
             finally:
                 db.close()
 
-            await _publish_tts_with_barge_in(ctx.room, result["reply"], mic)
+            try:
+                await asyncio.wait_for(
+                    _publish_tts_with_barge_in(ctx.room, reply_text, mic),
+                    timeout=45.0,
+                )
+            except asyncio.TimeoutError:
+                log.warning("TTS timed out — ending call anyway")
+                break
+            except Exception:
+                log.exception("TTS failed — ending call anyway")
+                break
 
             if result.get("handoff_requested"):
                 log.info(

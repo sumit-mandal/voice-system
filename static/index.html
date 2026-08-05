@@ -58,7 +58,7 @@
       color: var(--accent);
     }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    #log, #meta {
+    #log, #meta, #conversation {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px;
       white-space: pre-wrap;
@@ -68,6 +68,34 @@
       max-height: 240px;
       overflow: auto;
       margin-top: 12px;
+    }
+    #conversation {
+      max-height: 360px;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+      background: #f7faf8;
+    }
+    #conversation .turn {
+      margin: 0 0 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+    }
+    #conversation .user {
+      background: #e3eef8;
+      border-left: 3px solid #2b6cb0;
+    }
+    #conversation .assistant {
+      background: #e7f3ec;
+      border-left: 3px solid #1f6b4a;
+    }
+    #conversation .role {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-bottom: 2px;
     }
     .hint { color: var(--muted); font-size: 0.9rem; margin-top: 8px; }
     audio { width: 100%; margin-top: 12px; }
@@ -114,14 +142,18 @@
       <h2>3) Live agent (LiveKit streaming)</h2>
       <p class="hint">
         Needs Docker LiveKit + <code>./scripts/run_worker.sh</code> running.
-        Flow: name → age → ready? → diseases → medications → goodbye.
-        Say you want a human / doctor / specialist to trigger a Twilio handoff.
+        Ava intake: caller → child → diagnosis/insurance → graceful close.
+        Live STT (you) and TTS (Ava) appear below as the call progresses.
       </p>
       <div class="row">
         <button id="btnStart" type="button">Start live session</button>
+        <button id="btnMic" class="secondary" type="button" disabled>Mute mic</button>
         <button id="btnStop" class="secondary" type="button" disabled>Disconnect</button>
+        <span id="micStatus" class="hint">Mic off</span>
       </div>
       <div id="meta">Not connected</div>
+      <h3 style="margin:16px 0 0;font-size:1rem">Conversation (STT / TTS)</h3>
+      <div id="conversation"><div class="hint">Start a session to see the live transcript.</div></div>
       <div id="log"></div>
     </section>
   </main>
@@ -131,15 +163,103 @@
 
     const logEl = document.getElementById("log");
     const metaEl = document.getElementById("meta");
+    const convoEl = document.getElementById("conversation");
     const quickStatus = document.getElementById("quickStatus");
     const quickAudio = document.getElementById("quickAudio");
+    const micStatus = document.getElementById("micStatus");
 
     let room = null;
+    let activeCallSid = null;
+    let micEnabled = false;
+    let localMicTrack = null;
+    let transcriptPoll = null;
+    let lastTranscript = "";
 
     function log(msg) {
       const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
       console.log(line);
       logEl.textContent = `${line}\n` + logEl.textContent;
+    }
+
+    function renderConversation(transcript) {
+      if (!transcript || !transcript.trim()) {
+        convoEl.innerHTML = '<div class="hint">Waiting for speech…</div>';
+        return;
+      }
+      // Repair legacy rows where separately persisted role lines were concatenated.
+      const lines = transcript
+        .replace(/(assistant:|user:)/g, "\n$1")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const html = lines.map((line) => {
+        const isUser = line.startsWith("user:");
+        const isAsst = line.startsWith("assistant:");
+        let role = "system";
+        let text = line;
+        if (isUser) {
+          role = "You (STT)";
+          text = line.slice(5).trim();
+        } else if (isAsst) {
+          role = "Ava (TTS)";
+          text = line.slice(10).trim();
+          if (text === "greeting") text = "Ava connected.";
+        }
+        const cls = isUser ? "user" : "assistant";
+        return `<div class="turn ${cls}"><div class="role">${role}</div>${escapeHtml(text)}</div>`;
+      }).join("");
+      convoEl.innerHTML = html || '<div class="hint">Waiting for speech…</div>';
+      convoEl.scrollTop = convoEl.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function stopTranscriptPoll() {
+      if (transcriptPoll) {
+        clearInterval(transcriptPoll);
+        transcriptPoll = null;
+      }
+    }
+
+    function startTranscriptPoll(callSid) {
+      stopTranscriptPoll();
+      activeCallSid = callSid;
+      lastTranscript = "";
+      renderConversation("");
+      transcriptPoll = setInterval(async () => {
+        if (!activeCallSid) return;
+        try {
+          const res = await fetch(`/calls/${encodeURIComponent(activeCallSid)}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          const t = data.transcript || "";
+          if (t !== lastTranscript) {
+            lastTranscript = t;
+            renderConversation(t);
+          }
+          if (data.status && ["complete", "handed_off", "handoff_pending"].includes(data.status)) {
+            metaEl.textContent = JSON.stringify(
+              {
+                call_sid: data.call_sid,
+                status: data.status,
+                patient_name: data.patient_name,
+                diseases: data.diseases,
+                medications: data.medications,
+              },
+              null,
+              2
+            );
+          }
+        } catch (err) {
+          console.warn("transcript poll failed", err);
+        }
+      }, 1000);
     }
 
     // --- Quick STT/TTS (record WAV via AudioContext) ---
@@ -263,6 +383,7 @@
         const session = await res.json();
         metaEl.textContent = JSON.stringify(session, null, 2);
         log(`Session room=${session.room_name} call_sid=${session.call_sid}`);
+        startTranscriptPoll(session.call_sid);
 
         room = new Room({ adaptiveStream: true, dynacast: true });
         room
@@ -286,24 +407,91 @@
         await room.connect(session.livekit_url, session.token);
         log("Connected to room");
 
-        const mic = await createLocalAudioTrack({ echoCancellation: true, noiseSuppression: true });
-        await room.localParticipant.publishTrack(mic);
+        if (!window.isSecureContext) {
+          throw new Error(
+            "Mic requires a secure context. Open http://localhost:8000 in Chrome/Safari " +
+              "(not Cursor Simple Browser, and not a LAN IP over http)."
+          );
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error(
+            "navigator.mediaDevices.getUserMedia is unavailable. " +
+              "Use Chrome/Safari at http://localhost:8000 and allow microphone access."
+          );
+        }
+
+        // Prefer LiveKit helper; fall back to createLocalAudioTrack.
+        if (typeof room.localParticipant.setMicrophoneEnabled === "function") {
+          await room.localParticipant.setMicrophoneEnabled(true);
+        } else {
+          const mic = await createLocalAudioTrack({
+            echoCancellation: true,
+            noiseSuppression: true,
+          });
+          await room.localParticipant.publishTrack(mic);
+          localMicTrack = mic;
+        }
         log("Microphone published — wait for agent greeting, then speak");
+        micEnabled = true;
+        document.getElementById("btnMic").disabled = false;
+        document.getElementById("btnMic").textContent = "Mute mic";
+        micStatus.textContent = "Mic on";
 
         btnStop.disabled = false;
       } catch (err) {
         console.error(err);
         log(`Error: ${err.message || err}`);
+        stopTranscriptPoll();
+        if (room) {
+          await room.disconnect();
+          room = null;
+        }
+        localMicTrack = null;
+        micEnabled = false;
+        document.getElementById("btnMic").disabled = true;
+        micStatus.textContent = "Mic off";
         btnStart.disabled = false;
       }
     };
 
+    document.getElementById("btnMic").onclick = async () => {
+      if (!room) return;
+      const btnMic = document.getElementById("btnMic");
+      btnMic.disabled = true;
+      try {
+        micEnabled = !micEnabled;
+        if (typeof room.localParticipant.setMicrophoneEnabled === "function") {
+          await room.localParticipant.setMicrophoneEnabled(micEnabled);
+        } else if (localMicTrack) {
+          if (micEnabled) await localMicTrack.unmute();
+          else await localMicTrack.mute();
+        } else {
+          throw new Error("No local microphone track is available");
+        }
+        btnMic.textContent = micEnabled ? "Mute mic" : "Unmute mic";
+        micStatus.textContent = micEnabled ? "Mic on" : "Mic muted";
+        log(micEnabled ? "Microphone unmuted" : "Microphone muted");
+      } catch (err) {
+        micEnabled = !micEnabled;
+        log(`Mic error: ${err.message || err}`);
+      } finally {
+        btnMic.disabled = false;
+      }
+    };
+
     document.getElementById("btnStop").onclick = async () => {
+      stopTranscriptPoll();
+      activeCallSid = null;
       if (room) {
         await room.disconnect();
         room = null;
       }
+      localMicTrack = null;
+      micEnabled = false;
       document.getElementById("btnStart").disabled = false;
+      document.getElementById("btnMic").disabled = true;
+      document.getElementById("btnMic").textContent = "Mute mic";
+      micStatus.textContent = "Mic off";
       document.getElementById("btnStop").disabled = true;
       log("Stopped");
     };
