@@ -97,6 +97,34 @@
       color: var(--muted);
       margin-bottom: 2px;
     }
+    .chat-compose {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      align-items: flex-end;
+    }
+    .chat-compose textarea {
+      flex: 1;
+      min-height: 44px;
+      max-height: 120px;
+      resize: vertical;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font: inherit;
+      line-height: 1.4;
+    }
+    .mode-pill {
+      display: inline-block;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #e8eee9;
+      color: var(--muted);
+    }
+    .mode-pill.active-voice { background: #e3eef8; color: #2b6cb0; }
+    .mode-pill.active-chat { background: #e7f3ec; color: #1f6b4a; }
     .hint { color: var(--muted); font-size: 0.9rem; margin-top: 8px; }
     audio { width: 100%; margin-top: 12px; }
   </style>
@@ -105,8 +133,8 @@
   <main>
     <h1>Browser voice test</h1>
     <p class="lead">
-      Live stream your mic into LiveKit, hear the agent (PocketTTS), and verify
-      faster-whisper STT. Allow microphone access when prompted.
+      Talk to Ava by voice (LiveKit) or chat (text). Voice needs the worker + Docker;
+      chat only needs the API.
     </p>
 
     <section>
@@ -139,21 +167,34 @@
     </section>
 
     <section>
-      <h2>3) Live agent (LiveKit streaming)</h2>
+      <h2>3) Talk to Ava (voice + chat)</h2>
       <p class="hint">
-        Needs Docker LiveKit + <code>./scripts/run_worker.sh</code> running.
-        Ava intake: caller → child → diagnosis/insurance → graceful close.
-        Live STT (you) and TTS (Ava) appear below as the call progresses.
+        Use <strong>voice</strong> (LiveKit + mic) or <strong>chat</strong> (text only).
+        Both run the same Ava intake. Chat does not need Docker/LiveKit.
       </p>
+      <div class="row" style="margin-bottom:8px">
+        <span id="sessionMode" class="mode-pill">No session</span>
+      </div>
       <div class="row">
-        <button id="btnStart" type="button">Start live session</button>
+        <button id="btnStart" type="button">Start voice</button>
         <button id="btnMic" class="secondary" type="button" disabled>Mute mic</button>
-        <button id="btnStop" class="secondary" type="button" disabled>Disconnect</button>
+        <button id="btnStartChat" class="secondary" type="button">Start chat</button>
+        <button id="btnStop" class="secondary" type="button" disabled>End session</button>
         <span id="micStatus" class="hint">Mic off</span>
       </div>
       <div id="meta">Not connected</div>
-      <h3 style="margin:16px 0 0;font-size:1rem">Conversation (STT / TTS)</h3>
-      <div id="conversation"><div class="hint">Start a session to see the live transcript.</div></div>
+      <h3 style="margin:16px 0 0;font-size:1rem">Conversation</h3>
+      <div id="conversation"><div class="hint">Start voice or chat to begin.</div></div>
+      <div class="chat-compose">
+        <textarea
+          id="chatInput"
+          placeholder="Type a message to Ava…"
+          disabled
+          rows="2"
+        ></textarea>
+        <button id="btnSendChat" type="button" disabled>Send</button>
+      </div>
+      <div id="chatStatus" class="hint"></div>
       <div id="log"></div>
     </section>
   </main>
@@ -167,13 +208,18 @@
     const quickStatus = document.getElementById("quickStatus");
     const quickAudio = document.getElementById("quickAudio");
     const micStatus = document.getElementById("micStatus");
+    const chatInput = document.getElementById("chatInput");
+    const chatStatus = document.getElementById("chatStatus");
+    const sessionModeEl = document.getElementById("sessionMode");
 
     let room = null;
     let activeCallSid = null;
+    let sessionMode = null; // "voice" | "chat" | null
     let micEnabled = false;
     let localMicTrack = null;
     let transcriptPoll = null;
     let lastTranscript = "";
+    let chatBusy = false;
 
     function log(msg) {
       const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -181,9 +227,28 @@
       logEl.textContent = `${line}\n` + logEl.textContent;
     }
 
-    function renderConversation(transcript) {
+    function setSessionMode(mode) {
+      sessionMode = mode;
+      if (!mode) {
+        sessionModeEl.textContent = "No session";
+        sessionModeEl.className = "mode-pill";
+      } else if (mode === "voice") {
+        sessionModeEl.textContent = "Voice session";
+        sessionModeEl.className = "mode-pill active-voice";
+      } else {
+        sessionModeEl.textContent = "Chat session";
+        sessionModeEl.className = "mode-pill active-chat";
+      }
+    }
+
+    function setChatEnabled(enabled) {
+      chatInput.disabled = !enabled;
+      document.getElementById("btnSendChat").disabled = !enabled || chatBusy;
+    }
+
+    function renderConversation(transcript, { voiceLabels = false } = {}) {
       if (!transcript || !transcript.trim()) {
-        convoEl.innerHTML = '<div class="hint">Waiting for speech…</div>';
+        convoEl.innerHTML = '<div class="hint">Waiting for messages…</div>';
         return;
       }
       // Repair legacy rows where separately persisted role lines were concatenated.
@@ -198,17 +263,17 @@
         let role = "system";
         let text = line;
         if (isUser) {
-          role = "You (STT)";
+          role = voiceLabels ? "You (STT)" : "You";
           text = line.slice(5).trim();
         } else if (isAsst) {
-          role = "Ava (TTS)";
+          role = voiceLabels ? "Ava (TTS)" : "Ava";
           text = line.slice(10).trim();
           if (text === "greeting") text = "Ava connected.";
         }
         const cls = isUser ? "user" : "assistant";
         return `<div class="turn ${cls}"><div class="role">${role}</div>${escapeHtml(text)}</div>`;
       }).join("");
-      convoEl.innerHTML = html || '<div class="hint">Waiting for speech…</div>';
+      convoEl.innerHTML = html || '<div class="hint">Waiting for messages…</div>';
       convoEl.scrollTop = convoEl.scrollHeight;
     }
 
@@ -231,7 +296,7 @@
       stopTranscriptPoll();
       activeCallSid = callSid;
       lastTranscript = "";
-      renderConversation("");
+      renderConversation("", { voiceLabels: sessionMode === "voice" });
       transcriptPoll = setInterval(async () => {
         if (!activeCallSid) return;
         try {
@@ -241,7 +306,7 @@
           const t = data.transcript || "";
           if (t !== lastTranscript) {
             lastTranscript = t;
-            renderConversation(t);
+            renderConversation(t, { voiceLabels: sessionMode === "voice" });
           }
           if (data.status && ["complete", "handed_off", "handoff_pending"].includes(data.status)) {
             metaEl.textContent = JSON.stringify(
@@ -255,11 +320,39 @@
               null,
               2
             );
+            if (sessionMode === "chat" && data.status === "complete") {
+              setChatEnabled(false);
+              chatStatus.textContent = "Intake complete.";
+            }
           }
         } catch (err) {
           console.warn("transcript poll failed", err);
         }
       }, 1000);
+    }
+
+    async function endSession() {
+      stopTranscriptPoll();
+      activeCallSid = null;
+      if (room) {
+        await room.disconnect();
+        room = null;
+      }
+      localMicTrack = null;
+      micEnabled = false;
+      setSessionMode(null);
+      setChatEnabled(false);
+      chatInput.value = "";
+      chatStatus.textContent = "";
+      lastTranscript = "";
+      convoEl.innerHTML = '<div class="hint">Start voice or chat to begin.</div>';
+      document.getElementById("btnStart").disabled = false;
+      document.getElementById("btnStartChat").disabled = false;
+      document.getElementById("btnMic").disabled = true;
+      document.getElementById("btnMic").textContent = "Mute mic";
+      micStatus.textContent = "Mic off";
+      document.getElementById("btnStop").disabled = true;
+      metaEl.textContent = "Not connected";
     }
 
     // --- Quick STT/TTS (record WAV via AudioContext) ---
@@ -371,12 +464,17 @@
       }
     };
 
-    // --- LiveKit live agent ---
+    // --- LiveKit live agent (voice) ---
     document.getElementById("btnStart").onclick = async () => {
       const btnStart = document.getElementById("btnStart");
       const btnStop = document.getElementById("btnStop");
       btnStart.disabled = true;
+      document.getElementById("btnStartChat").disabled = true;
       try {
+        await endSession();
+        btnStart.disabled = true;
+        document.getElementById("btnStartChat").disabled = true;
+        setSessionMode("voice");
         log("Requesting browser session…");
         const res = await fetch("/browser/session", { method: "POST" });
         if (!res.ok) throw new Error(await res.text());
@@ -384,6 +482,8 @@
         metaEl.textContent = JSON.stringify(session, null, 2);
         log(`Session room=${session.room_name} call_sid=${session.call_sid}`);
         startTranscriptPoll(session.call_sid);
+        // Voice transcript is STT/TTS; chat box stays disabled during voice.
+        setChatEnabled(false);
 
         room = new Room({ adaptiveStream: true, dynacast: true });
         room
@@ -441,16 +541,9 @@
       } catch (err) {
         console.error(err);
         log(`Error: ${err.message || err}`);
-        stopTranscriptPoll();
-        if (room) {
-          await room.disconnect();
-          room = null;
-        }
-        localMicTrack = null;
-        micEnabled = false;
-        document.getElementById("btnMic").disabled = true;
-        micStatus.textContent = "Mic off";
-        btnStart.disabled = false;
+        await endSession();
+        document.getElementById("btnStart").disabled = false;
+        document.getElementById("btnStartChat").disabled = false;
       }
     };
 
@@ -479,20 +572,120 @@
       }
     };
 
-    document.getElementById("btnStop").onclick = async () => {
-      stopTranscriptPoll();
-      activeCallSid = null;
-      if (room) {
-        await room.disconnect();
-        room = null;
+    // --- Text chat with Ava ---
+    document.getElementById("btnStartChat").onclick = async () => {
+      const btn = document.getElementById("btnStartChat");
+      btn.disabled = true;
+      document.getElementById("btnStart").disabled = true;
+      try {
+        await endSession();
+        btn.disabled = true;
+        document.getElementById("btnStart").disabled = true;
+        setSessionMode("chat");
+        chatStatus.textContent = "Starting chat…";
+        const res = await fetch("/browser/chat/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.detail || JSON.stringify(body) || res.statusText);
+
+        activeCallSid = body.call_sid;
+        metaEl.textContent = JSON.stringify(
+          { call_sid: body.call_sid, status: body.status, mode: "chat" },
+          null,
+          2
+        );
+        lastTranscript = `assistant: ${body.greeting}\n`;
+        renderConversation(lastTranscript);
+        startTranscriptPoll(body.call_sid);
+        setChatEnabled(true);
+        chatStatus.textContent = "Chat ready — type a reply below.";
+        document.getElementById("btnStop").disabled = false;
+        chatInput.focus();
+        log(`Chat session started | call_sid=${body.call_sid}`);
+      } catch (err) {
+        console.error(err);
+        chatStatus.textContent = `Error: ${err.message || err}`;
+        log(`Chat error: ${err.message || err}`);
+        await endSession();
+        document.getElementById("btnStart").disabled = false;
+        document.getElementById("btnStartChat").disabled = false;
       }
-      localMicTrack = null;
-      micEnabled = false;
-      document.getElementById("btnStart").disabled = false;
-      document.getElementById("btnMic").disabled = true;
-      document.getElementById("btnMic").textContent = "Mute mic";
-      micStatus.textContent = "Mic off";
-      document.getElementById("btnStop").disabled = true;
+    };
+
+    async function sendChatMessage() {
+      if (sessionMode !== "chat" || !activeCallSid || chatBusy) return;
+      const text = (chatInput.value || "").trim();
+      if (!text) return;
+
+      chatBusy = true;
+      setChatEnabled(true);
+      document.getElementById("btnSendChat").disabled = true;
+      chatStatus.textContent = "Ava is typing…";
+      try {
+        const res = await fetch("/browser/chat/message", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ call_sid: activeCallSid, text }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.detail || JSON.stringify(body) || res.statusText);
+
+        chatInput.value = "";
+        lastTranscript = body.transcript || lastTranscript;
+        renderConversation(lastTranscript);
+        metaEl.textContent = JSON.stringify(
+          {
+            call_sid: body.call_sid,
+            status: body.status,
+            pending_field: body.pending_field,
+            caller_name: body.caller_name,
+            child_first_name: body.child_first_name,
+            primary_disposition: body.primary_disposition,
+          },
+          null,
+          2
+        );
+
+        if (body.is_complete || body.should_end || body.handoff_requested) {
+          setChatEnabled(false);
+          chatStatus.textContent = body.handoff_requested
+            ? "Handoff requested."
+            : "Intake complete.";
+          chatBusy = false;
+          return;
+        }
+        chatStatus.textContent = body.pending_field
+          ? `Next: ${body.pending_field}`
+          : "";
+      } catch (err) {
+        console.error(err);
+        chatStatus.textContent = `Error: ${err.message || err}`;
+      } finally {
+        chatBusy = false;
+        if (
+          sessionMode === "chat"
+          && activeCallSid
+          && !(chatStatus.textContent || "").match(/complete|Handoff/)
+        ) {
+          setChatEnabled(true);
+          chatInput.focus();
+        }
+      }
+    }
+
+    document.getElementById("btnSendChat").onclick = () => sendChatMessage();
+    chatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+
+    document.getElementById("btnStop").onclick = async () => {
+      await endSession();
       log("Stopped");
     };
   </script>

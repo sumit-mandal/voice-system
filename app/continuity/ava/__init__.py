@@ -8,6 +8,7 @@ from app.continuity.ava.policy import (
     build_ava_email_addendum,
     build_ava_phone_addendum,
     build_ava_shared_policy,
+    chat_greeting,
     phone_greeting,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "build_ava_email_addendum",
     "build_ava_phone_addendum",
     "build_ava_shared_policy",
+    "chat_greeting",
     "phone_greeting",
 ]

@@ -154,6 +154,13 @@ def phone_greeting(clinic_name: str) -> str:
     )
 
 
+def chat_greeting(clinic_name: str) -> str:
+    return (
+        f"Hi, I'm Ava from {clinic_name}. I can help you get started with intake over chat. "
+        "Are you reaching out about services for a child?"
+    )
+
+
 # Backward-compatible names resolved at import time only as fallbacks;
 # prefer the build_* helpers with a DB-fetched clinic_name.
 AVA_SHARED_POLICY = build_ava_shared_policy("Our Clinic")
