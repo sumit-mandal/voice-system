@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -17,7 +19,7 @@ from app.continuity.ava.policy import chat_greeting
 from app.db import continuity_repo as crepo
 from app.db import repository as repo
 from app.db.clinic_repo import get_clinic_name
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.livekit_app.rooms import (
     create_participant_token,
     create_room_with_agent,
@@ -249,6 +251,134 @@ async def browser_chat_message(
         child_first_name=result.get("child_first_name"),
         primary_disposition=result.get("primary_disposition"),
         transcript=transcript,
+    )
+
+
+def _sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, default=str)}\n\n"
+
+
+def _chunk_reply_for_stream(reply: str, *, max_chars: int = 12) -> list[str]:
+    """Split a final reply into small chunks for progressive UI streaming."""
+    text = (reply or "").strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    buf = ""
+    for word in text.split(" "):
+        piece = word if not buf else f" {word}"
+        if buf and len(buf) + len(piece) > max_chars:
+            chunks.append(buf)
+            buf = word
+        else:
+            buf += piece
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+@router.post("/chat/message/stream")
+async def browser_chat_message_stream(
+    body: BrowserChatMessageRequest,
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """
+    One consistent Ava reply, streamed to the UI as SSE tokens.
+
+    Events: status | token | done | error
+    """
+    call_sid = body.call_sid.strip()
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text must be non-empty")
+
+    session = repo.get_by_call_sid(db, call_sid)
+    if session is None:
+        raise HTTPException(status_code=404, detail="chat session not found")
+
+    prior = _CHAT_STATE.get(call_sid)
+    if prior is None:
+        prior = seed_prior_after_greeting(call_sid)
+        _CHAT_STATE[call_sid] = prior
+
+    repo.append_transcript(db, call_sid=call_sid, line=f"user: {text}")
+
+    async def event_gen():
+        try:
+            # Status only — never shown as an assistant message bubble.
+            yield _sse({"type": "status", "text": "Ava is typing…"})
+
+            result = await asyncio.to_thread(
+                run_intake_turn,
+                call_sid=call_sid,
+                user_text=text,
+                prior=prior,
+            )
+            _CHAT_STATE[call_sid] = result
+
+            final_reply = (
+                (result.get("reply") or "").strip()
+                or "Thanks. Our team will follow up."
+            )
+            status = _chat_status(result)
+
+            for chunk in _chunk_reply_for_stream(final_reply):
+                yield _sse({"type": "token", "text": chunk})
+                await asyncio.sleep(0.025)
+
+            db2 = SessionLocal()
+            try:
+                repo.append_transcript(
+                    db2, call_sid=call_sid, line=f"assistant: {final_reply}"
+                )
+                repo.update_intake(
+                    db2,
+                    call_sid=call_sid,
+                    patient_name=result.get("patient_name") or result.get("caller_name"),
+                    patient_age=result.get("patient_age"),
+                    ready_to_proceed=result.get("ready_to_proceed"),
+                    diseases=result.get("diseases") or result.get("diagnosis_stated"),
+                    medications=result.get("medications")
+                    or result.get("insurance_carrier"),
+                    transcript=None,
+                    status=status,
+                    handoff_reason=result.get("handoff_reason") or None,
+                    handoff_summary=result.get("handoff_summary") or None,
+                )
+                row = repo.get_by_call_sid(db2, call_sid)
+                transcript = (row.transcript if row else None) or _transcript_from_state(
+                    result
+                )
+            finally:
+                db2.close()
+
+            yield _sse(
+                {
+                    "type": "done",
+                    "call_sid": call_sid,
+                    "reply": final_reply,
+                    "status": status,
+                    "pending_field": result.get("pending_field"),
+                    "is_complete": bool(result.get("is_complete")),
+                    "should_end": bool(result.get("should_end")),
+                    "handoff_requested": bool(result.get("handoff_requested")),
+                    "caller_name": result.get("caller_name"),
+                    "child_first_name": result.get("child_first_name"),
+                    "primary_disposition": result.get("primary_disposition"),
+                    "transcript": transcript,
+                }
+            )
+        except Exception as exc:
+            log.exception("Chat stream failed | call_sid=%s", call_sid)
+            yield _sse({"type": "error", "detail": str(exc)})
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

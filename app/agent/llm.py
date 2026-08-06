@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -43,16 +45,7 @@ def build_llm() -> ChatGoogleGenerativeAI:
     return _LLM
 
 
-def chat_completion(messages: list[dict[str, str]]) -> str:
-    """Run a chat completion and return assistant text."""
-    settings = get_settings()
-    llm = build_llm()
-    log.debug(
-        "chat_completion (Gemini) | model=%s messages=%s",
-        settings.gemini_model,
-        len(messages),
-    )
-
+def _to_lc_messages(messages: list[dict[str, str]]) -> list:
     lc_messages = []
     for msg in messages:
         role = msg["role"]
@@ -63,10 +56,41 @@ def chat_completion(messages: list[dict[str, str]]) -> str:
             lc_messages.append(AIMessage(content=content))
         else:
             lc_messages.append(HumanMessage(content=content))
+    return lc_messages
 
-    response = llm.invoke(lc_messages)
+
+def chat_completion(messages: list[dict[str, str]]) -> str:
+    """Run a chat completion and return assistant text."""
+    settings = get_settings()
+    llm = build_llm()
+    log.debug(
+        "chat_completion (Gemini) | model=%s messages=%s",
+        settings.gemini_model,
+        len(messages),
+    )
+
+    response = llm.invoke(_to_lc_messages(messages))
     content = response.content if isinstance(response.content, str) else str(response.content)
     log.debug("Gemini content | %r", content[:1200])
     if not content.strip():
         raise ValueError("Gemini returned empty content")
     return content
+
+
+def chat_completion_stream(messages: list[dict[str, str]]) -> Iterator[str]:
+    """Yield text deltas from Gemini as they arrive (for low perceived latency)."""
+    settings = get_settings()
+    llm = build_llm()
+    log.debug(
+        "chat_completion_stream (Gemini) | model=%s messages=%s",
+        settings.gemini_model,
+        len(messages),
+    )
+    for chunk in llm.stream(_to_lc_messages(messages)):
+        content = chunk.content
+        if content is None:
+            continue
+        if not isinstance(content, str):
+            content = str(content)
+        if content:
+            yield content

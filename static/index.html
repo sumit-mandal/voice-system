@@ -97,6 +97,16 @@
       color: var(--muted);
       margin-bottom: 2px;
     }
+    #conversation .assistant.streaming .stream-text::after {
+      content: "|";
+      display: inline-block;
+      margin-left: 2px;
+      animation: blink 1s step-end infinite;
+      color: var(--accent);
+    }
+    @keyframes blink {
+      50% { opacity: 0; }
+    }
     .chat-compose {
       display: flex;
       gap: 8px;
@@ -246,13 +256,13 @@
       document.getElementById("btnSendChat").disabled = !enabled || chatBusy;
     }
 
-    function renderConversation(transcript, { voiceLabels = false } = {}) {
-      if (!transcript || !transcript.trim()) {
+    function renderConversation(transcript, { voiceLabels = false, streamingText = null } = {}) {
+      if ((!transcript || !transcript.trim()) && !streamingText) {
         convoEl.innerHTML = '<div class="hint">Waiting for messages…</div>';
         return;
       }
       // Repair legacy rows where separately persisted role lines were concatenated.
-      const lines = transcript
+      const lines = (transcript || "")
         .replace(/(assistant:|user:)/g, "\n$1")
         .split("\n")
         .map((line) => line.trim())
@@ -273,7 +283,12 @@
         const cls = isUser ? "user" : "assistant";
         return `<div class="turn ${cls}"><div class="role">${role}</div>${escapeHtml(text)}</div>`;
       }).join("");
-      convoEl.innerHTML = html || '<div class="hint">Waiting for messages…</div>';
+
+      let streamHtml = "";
+      if (streamingText !== null) {
+        streamHtml = `<div class="turn assistant streaming"><div class="role">Ava</div><span class="stream-text">${escapeHtml(streamingText)}</span></div>`;
+      }
+      convoEl.innerHTML = (html + streamHtml) || '<div class="hint">Waiting for messages…</div>';
       convoEl.scrollTop = convoEl.scrollHeight;
     }
 
@@ -624,45 +639,98 @@
       setChatEnabled(true);
       document.getElementById("btnSendChat").disabled = true;
       chatStatus.textContent = "Ava is typing…";
+      chatInput.value = "";
+      // Pause poll so it doesn't overwrite the live stream bubble.
+      stopTranscriptPoll();
+
+      lastTranscript = `${lastTranscript || ""}user: ${text}\n`;
+      let assistantDraft = "";
+      renderConversation(lastTranscript, { streamingText: "" });
+
       try {
-        const res = await fetch("/browser/chat/message", {
+        const res = await fetch("/browser/chat/message/stream", {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", Accept: "text/event-stream" },
           body: JSON.stringify({ call_sid: activeCallSid, text }),
         });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(body.detail || JSON.stringify(body) || res.statusText);
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.detail || res.statusText);
+        }
+        if (!res.body) throw new Error("No stream body from server");
 
-        chatInput.value = "";
-        lastTranscript = body.transcript || lastTranscript;
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let donePayload = null;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split("\n\n");
+          buffer = parts.pop() || "";
+          for (const part of parts) {
+            const line = part.split("\n").find((l) => l.startsWith("data: "));
+            if (!line) continue;
+            let evt;
+            try {
+              evt = JSON.parse(line.slice(6));
+            } catch {
+              continue;
+            }
+            if (evt.type === "status") {
+              chatStatus.textContent = evt.text || "Ava is typing…";
+              if (!assistantDraft) {
+                renderConversation(lastTranscript, { streamingText: "" });
+              }
+            } else if (evt.type === "token") {
+              assistantDraft += evt.text || "";
+              renderConversation(lastTranscript, { streamingText: assistantDraft });
+              chatStatus.textContent = "Ava is typing…";
+            } else if (evt.type === "done") {
+              donePayload = evt;
+              assistantDraft = evt.reply || assistantDraft;
+              renderConversation(lastTranscript, { streamingText: assistantDraft });
+            } else if (evt.type === "error") {
+              throw new Error(evt.detail || "stream error");
+            }
+          }
+        }
+
+        if (!donePayload) throw new Error("Stream ended without completion");
+
+        lastTranscript = donePayload.transcript || `${lastTranscript}assistant: ${assistantDraft}\n`;
         renderConversation(lastTranscript);
+        startTranscriptPoll(activeCallSid);
         metaEl.textContent = JSON.stringify(
           {
-            call_sid: body.call_sid,
-            status: body.status,
-            pending_field: body.pending_field,
-            caller_name: body.caller_name,
-            child_first_name: body.child_first_name,
-            primary_disposition: body.primary_disposition,
+            call_sid: donePayload.call_sid,
+            status: donePayload.status,
+            pending_field: donePayload.pending_field,
+            caller_name: donePayload.caller_name,
+            child_first_name: donePayload.child_first_name,
+            primary_disposition: donePayload.primary_disposition,
           },
           null,
           2
         );
 
-        if (body.is_complete || body.should_end || body.handoff_requested) {
+        if (donePayload.is_complete || donePayload.should_end || donePayload.handoff_requested) {
           setChatEnabled(false);
-          chatStatus.textContent = body.handoff_requested
+          chatStatus.textContent = donePayload.handoff_requested
             ? "Handoff requested."
             : "Intake complete.";
           chatBusy = false;
           return;
         }
-        chatStatus.textContent = body.pending_field
-          ? `Next: ${body.pending_field}`
+        chatStatus.textContent = donePayload.pending_field
+          ? `Next: ${donePayload.pending_field}`
           : "";
       } catch (err) {
         console.error(err);
         chatStatus.textContent = `Error: ${err.message || err}`;
+        if (activeCallSid) startTranscriptPoll(activeCallSid);
       } finally {
         chatBusy = false;
         if (

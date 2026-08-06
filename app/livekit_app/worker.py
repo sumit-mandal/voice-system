@@ -27,7 +27,7 @@ from app.continuity.ava.policy import phone_greeting
 
 log = get_logger(__name__)
 
-SILENCE_SECONDS = 1.2 #After 1.2 seconds of silence, the system assumes the user has finished speaking
+SILENCE_SECONDS = 0.45  # snappy end-of-utterance (was 1.2s — major latency source)
 MAX_UTTERANCE_SECONDS = 12.0 #The system will stop recording after 12 seconds of speech
 MIN_UTTERANCE_SECONDS = 0.45 #The system will not consider the speech to be valid if it is less than 0.45 seconds
 RMS_SPEECH_THRESHOLD = 250.0 #The system will consider the speech to be valid if it is greater than 250.0 decibels
@@ -37,6 +37,10 @@ BARGE_IN_MIN_FRAMES = 6  # ~120ms at 20ms/frame
 BARGE_IN_ECHO_GUARD_S = 0.35  # ignore mic briefly after TTS starts
 PARTICIPANT_WAIT_SECONDS = 60.0
 TRACK_WAIT_SECONDS = 45.0
+
+# Instant acknowledgements while STT/LLM run (pre-synthesized at call start).
+_FILLER_PHRASES = ("Okay.", "Got it.", "Sure.", "Alright.")
+_FILLER_CACHE: dict[str, tuple[bytes, int]] = {}  # text -> (pcm_int16, sample_rate)
 
 
 def _save_transcript_line(call_sid: str, line: str) -> None:
@@ -132,23 +136,22 @@ class MicPump:
         return item
 
 
-async def _publish_tts_with_barge_in(room: rtc.Room, text: str, mic: MicPump) -> bool:
-    """
-    Play TTS while watching the mic. Returns True if user barged in (interrupted).
-    """
-    tts = get_tts()
-    log.debug("Publishing TTS (barge-in enabled) | text=%r", text)
-    result = await asyncio.to_thread(tts.synthesize, text)
-
-    source = rtc.AudioSource(result.sample_rate, 1)
+async def _play_pcm_with_barge_in(
+    room: rtc.Room,
+    pcm_int16: bytes,
+    sample_rate: int,
+    mic: MicPump,
+    *,
+    label: str = "audio",
+) -> bool:
+    """Play pre-rendered PCM16 mono while watching for barge-in."""
+    source = rtc.AudioSource(sample_rate, 1)
     track = rtc.LocalAudioTrack.create_audio_track("agent-voice", source)
     options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
     pub = await room.local_participant.publish_track(track, options)
-    log.debug("Audio track published | sid=%s", pub.sid)
 
     barged = asyncio.Event()
     ignore_until = time.monotonic() + BARGE_IN_ECHO_GUARD_S
-    # Discard leftover mic audio so we don't false-trigger on prior speech.
     mic.clear()
 
     async def _watch_barge_in() -> None:
@@ -163,14 +166,8 @@ async def _publish_tts_with_barge_in(room: rtc.Room, text: str, mic: MicPump) ->
             rms = _pcm16_rms(pcm)
             if rms >= BARGE_IN_RMS:
                 consecutive += 1
-                log.debug(
-                    "Barge-in candidate | rms=%.1f consecutive=%s/%s",
-                    rms,
-                    consecutive,
-                    BARGE_IN_MIN_FRAMES,
-                )
                 if consecutive >= BARGE_IN_MIN_FRAMES:
-                    log.info("BARGE-IN detected | rms=%.1f — stopping TTS", rms)
+                    log.info("BARGE-IN detected | rms=%.1f — stopping %s", rms, label)
                     mic.push_preroll(frame)
                     barged.set()
                     return
@@ -178,8 +175,8 @@ async def _publish_tts_with_barge_in(room: rtc.Room, text: str, mic: MicPump) ->
                 consecutive = 0
 
     watch_task = asyncio.create_task(_watch_barge_in(), name="barge-in-watch")
-    samples = np.frombuffer(result.pcm_int16, dtype=np.int16)
-    frame_samples = max(result.sample_rate // 50, 1)
+    samples = np.frombuffer(pcm_int16, dtype=np.int16)
+    frame_samples = max(sample_rate // 50, 1)
     interrupted = False
     try:
         for i in range(0, len(samples), frame_samples):
@@ -194,14 +191,14 @@ async def _publish_tts_with_barge_in(room: rtc.Room, text: str, mic: MicPump) ->
                 chunk = np.concatenate([chunk, pad])
             audio_frame = rtc.AudioFrame(
                 data=chunk.tobytes(),
-                sample_rate=result.sample_rate,
+                sample_rate=sample_rate,
                 num_channels=1,
                 samples_per_channel=frame_samples,
             )
             await source.capture_frame(audio_frame)
             await asyncio.sleep(0.02)
         if not interrupted:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
     finally:
         watch_task.cancel()
         try:
@@ -211,8 +208,49 @@ async def _publish_tts_with_barge_in(room: rtc.Room, text: str, mic: MicPump) ->
         try:
             await room.local_participant.unpublish_track(pub.sid)
         except Exception:
-            log.exception("Failed to unpublish TTS track")
+            log.exception("Failed to unpublish %s track", label)
 
+    return interrupted
+
+
+def _warm_filler_cache() -> None:
+    """Pre-synthesize short fillers so acknowledgements are instant."""
+    if _FILLER_CACHE:
+        return
+    tts = get_tts()
+    for phrase in _FILLER_PHRASES:
+        try:
+            result = tts.synthesize(phrase)
+            _FILLER_CACHE[phrase] = (result.pcm_int16, result.sample_rate)
+            log.info("Warmed filler | phrase=%r duration_bytes=%s", phrase, len(result.pcm_int16))
+        except Exception:
+            log.exception("Failed to warm filler | phrase=%r", phrase)
+
+
+def _pick_filler() -> tuple[str, bytes, int] | None:
+    if not _FILLER_CACHE:
+        return None
+    # Rotate by wall clock so consecutive turns don't always sound identical.
+    phrases = list(_FILLER_CACHE.keys())
+    phrase = phrases[int(time.time()) % len(phrases)]
+    pcm, rate = _FILLER_CACHE[phrase]
+    return phrase, pcm, rate
+
+
+async def _publish_tts_with_barge_in(room: rtc.Room, text: str, mic: MicPump) -> bool:
+    """
+    Play TTS while watching the mic. Returns True if user barged in (interrupted).
+    """
+    tts = get_tts()
+    log.debug("Publishing TTS (barge-in enabled) | text=%r", text)
+    result = await asyncio.to_thread(tts.synthesize, text)
+    interrupted = await _play_pcm_with_barge_in(
+        room,
+        result.pcm_int16,
+        result.sample_rate,
+        mic,
+        label="TTS",
+    )
     if interrupted:
         log.info("TTS interrupted by user | chars=%s", len(text))
     else:
@@ -372,6 +410,7 @@ async def entrypoint(ctx: JobContext) -> None:
     log.debug("AudioStream + MicPump attached (barge-in enabled)")
 
     try:
+        await asyncio.to_thread(_warm_filler_cache)
         greeting = phone_greeting(get_clinic_name())
         await _publish_tts_with_barge_in(ctx.room, greeting, mic)
         _save_transcript_line(call_sid, f"assistant: {greeting}")
@@ -400,6 +439,19 @@ async def entrypoint(ctx: JobContext) -> None:
                 await _publish_tts_with_barge_in(ctx.room, nudge, mic)
                 continue
 
+            # Instant filler while STT + LLM run (masks processing latency).
+            filler = _pick_filler()
+            filler_task: asyncio.Task[bool] | None = None
+            if filler is not None:
+                phrase, filler_pcm, filler_rate = filler
+                log.info("Playing filler while processing | phrase=%r", phrase)
+                filler_task = asyncio.create_task(
+                    _play_pcm_with_barge_in(
+                        ctx.room, filler_pcm, filler_rate, mic, label="filler"
+                    ),
+                    name="filler-play",
+                )
+
             try:
                 transcript = await asyncio.wait_for(
                     asyncio.to_thread(stt.transcribe_pcm16, pcm, sample_rate=16000),
@@ -407,6 +459,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
             except asyncio.TimeoutError:
                 log.warning("STT timed out")
+                if filler_task:
+                    filler_task.cancel()
+                    try:
+                        await filler_task
+                    except asyncio.CancelledError:
+                        pass
                 empty_stt_streak += 1
                 if empty_stt_streak >= max_empty_stt:
                     bye = (
@@ -423,6 +481,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
             if not transcript.text:
                 log.warning("STT returned empty text")
+                if filler_task:
+                    filler_task.cancel()
+                    try:
+                        await filler_task
+                    except asyncio.CancelledError:
+                        pass
                 empty_stt_streak += 1
                 if empty_stt_streak >= max_empty_stt:
                     bye = "I'll wrap up for now. Please call back anytime. Goodbye."
@@ -474,9 +538,34 @@ async def entrypoint(ctx: JobContext) -> None:
                     "handoff_requested": False,
                 }
 
+            # Let filler finish (or cancel if still going) before main reply.
+            if filler_task is not None:
+                if not filler_task.done():
+                    # Don't cut mid-syllable unless barge-in; wait briefly then cancel.
+                    try:
+                        await asyncio.wait_for(asyncio.shield(filler_task), timeout=0.8)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        filler_task.cancel()
+                        try:
+                            await filler_task
+                        except asyncio.CancelledError:
+                            pass
+                else:
+                    try:
+                        await filler_task
+                    except asyncio.CancelledError:
+                        pass
+
             prior = result  # type: ignore[assignment]
             reply_text = (result.get("reply") or "").strip() or (
                 "Thanks. Our team will follow up. Goodbye."
+            )
+
+            # Synthesize reply in parallel with DB write.
+            tts = get_tts()
+            synth_task = asyncio.create_task(
+                asyncio.to_thread(tts.synthesize, reply_text),
+                name="reply-synth",
             )
 
             db = SessionLocal()
@@ -499,12 +588,22 @@ async def entrypoint(ctx: JobContext) -> None:
                     handoff_reason=result.get("handoff_reason") or None,
                     handoff_summary=result.get("handoff_summary") or None,
                 )
+                repo.append_transcript(
+                    db, call_sid=call_sid, line=f"assistant: {reply_text}"
+                )
             finally:
                 db.close()
 
             try:
+                synth = await asyncio.wait_for(synth_task, timeout=45.0)
                 await asyncio.wait_for(
-                    _publish_tts_with_barge_in(ctx.room, reply_text, mic),
+                    _play_pcm_with_barge_in(
+                        ctx.room,
+                        synth.pcm_int16,
+                        synth.sample_rate,
+                        mic,
+                        label="reply",
+                    ),
                     timeout=45.0,
                 )
             except asyncio.TimeoutError:
