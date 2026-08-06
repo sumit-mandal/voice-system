@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from app.config import get_settings
+from app.latency import log_latency
 from app.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -69,7 +71,9 @@ def chat_completion(messages: list[dict[str, str]]) -> str:
         len(messages),
     )
 
+    t0 = time.perf_counter()
     response = llm.invoke(_to_lc_messages(messages))
+    log_latency("llm", (time.perf_counter() - t0) * 1000.0, model=settings.gemini_model)
     content = response.content if isinstance(response.content, str) else str(response.content)
     log.debug("Gemini content | %r", content[:1200])
     if not content.strip():
@@ -86,7 +90,16 @@ def chat_completion_stream(messages: list[dict[str, str]]) -> Iterator[str]:
         settings.gemini_model,
         len(messages),
     )
+    t0 = time.perf_counter()
+    first = True
     for chunk in llm.stream(_to_lc_messages(messages)):
+        if first:
+            log_latency(
+                "llm_ttft",
+                (time.perf_counter() - t0) * 1000.0,
+                model=settings.gemini_model,
+            )
+            first = False
         content = chunk.content
         if content is None:
             continue
@@ -94,3 +107,4 @@ def chat_completion_stream(messages: list[dict[str, str]]) -> Iterator[str]:
             content = str(content)
         if content:
             yield content
+    log_latency("llm_stream_total", (time.perf_counter() - t0) * 1000.0, model=settings.gemini_model)

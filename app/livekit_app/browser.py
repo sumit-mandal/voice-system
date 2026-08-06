@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from typing import Any
 
@@ -20,6 +21,7 @@ from app.db import continuity_repo as crepo
 from app.db import repository as repo
 from app.db.clinic_repo import get_clinic_name
 from app.db.session import SessionLocal, get_db
+from app.latency import log_latency
 from app.livekit_app.rooms import (
     create_participant_token,
     create_room_with_agent,
@@ -308,12 +310,15 @@ async def browser_chat_message_stream(
             # Status only — never shown as an assistant message bubble.
             yield _sse({"type": "status", "text": "Ava is typing…"})
 
+            t0 = time.perf_counter()
             result = await asyncio.to_thread(
                 run_intake_turn,
                 call_sid=call_sid,
                 user_text=text,
                 prior=prior,
             )
+            llm_ms = (time.perf_counter() - t0) * 1000.0
+            log_latency("chat_llm_turn", llm_ms)
             _CHAT_STATE[call_sid] = result
 
             final_reply = (
@@ -366,6 +371,10 @@ async def browser_chat_message_stream(
                     "child_first_name": result.get("child_first_name"),
                     "primary_disposition": result.get("primary_disposition"),
                     "transcript": transcript,
+                    "latency": {
+                        "llm_ms": round(llm_ms, 1),
+                        "total_ms": round(llm_ms, 1),
+                    },
                 }
             )
         except Exception as exc:

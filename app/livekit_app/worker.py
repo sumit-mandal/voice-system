@@ -16,14 +16,15 @@ from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 from app.agent.graph import run_intake_turn, seed_prior_after_greeting
 from app.agent.state import IntakeState
 from app.config import get_settings
+from app.continuity.ava.policy import phone_greeting
 from app.db import repository as repo
 from app.db.clinic_repo import get_clinic_name
 from app.db.session import SessionLocal, init_db
+from app.latency import log_latency
 from app.logging_setup import get_logger, setup_logging
 from app.twilio_app.handoff import is_twilio_call_sid, redirect_call_to_human
 from app.voice.stt import get_stt
 from app.voice.tts import get_tts
-from app.continuity.ava.policy import phone_greeting
 
 log = get_logger(__name__)
 
@@ -237,13 +238,32 @@ def _pick_filler() -> tuple[str, bytes, int] | None:
     return phrase, pcm, rate
 
 
+async def _publish_latency(room: rtc.Room, **metrics: float) -> None:
+    """Send turn latency to browser clients over LiveKit data channel."""
+    payload = {
+        "type": "latency",
+        **{k: round(float(v), 1) for k, v in metrics.items() if v is not None},
+    }
+    try:
+        await room.local_participant.publish_data(
+            json.dumps(payload).encode("utf-8"),
+            reliable=True,
+            topic="latency",
+        )
+    except Exception:
+        log.debug("Failed to publish latency to room", exc_info=True)
+
+
 async def _publish_tts_with_barge_in(room: rtc.Room, text: str, mic: MicPump) -> bool:
     """
     Play TTS while watching the mic. Returns True if user barged in (interrupted).
     """
     tts = get_tts()
     log.debug("Publishing TTS (barge-in enabled) | text=%r", text)
+    t0 = time.perf_counter()
     result = await asyncio.to_thread(tts.synthesize, text)
+    synth_ms = (time.perf_counter() - t0) * 1000.0
+    t1 = time.perf_counter()
     interrupted = await _play_pcm_with_barge_in(
         room,
         result.pcm_int16,
@@ -251,6 +271,9 @@ async def _publish_tts_with_barge_in(room: rtc.Room, text: str, mic: MicPump) ->
         mic,
         label="TTS",
     )
+    play_ms = (time.perf_counter() - t1) * 1000.0
+    log_latency("tts_synth", synth_ms, chars=len(text))
+    log_latency("tts_play", play_ms, chars=len(text))
     if interrupted:
         log.info("TTS interrupted by user | chars=%s", len(text))
     else:
@@ -453,9 +476,16 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
 
             try:
+                stt_t0 = time.perf_counter()
                 transcript = await asyncio.wait_for(
                     asyncio.to_thread(stt.transcribe_pcm16, pcm, sample_rate=16000),
                     timeout=30.0,
+                )
+                stt_ms = (time.perf_counter() - stt_t0) * 1000.0
+                log_latency(
+                    "stt",
+                    stt_ms,
+                    text_len=len(transcript.text or ""),
                 )
             except asyncio.TimeoutError:
                 log.warning("STT timed out")
@@ -502,6 +532,7 @@ async def entrypoint(ctx: JobContext) -> None:
             _save_transcript_line(call_sid, f"user: {transcript.text}")
 
             try:
+                llm_t0 = time.perf_counter()
                 result = await asyncio.wait_for(
                     asyncio.to_thread(
                         run_intake_turn,
@@ -511,8 +542,11 @@ async def entrypoint(ctx: JobContext) -> None:
                     ),
                     timeout=45.0,
                 )
+                llm_ms = (time.perf_counter() - llm_t0) * 1000.0
+                log_latency("llm_turn", llm_ms)
             except asyncio.TimeoutError:
                 log.exception("Intake turn timed out — forcing graceful close")
+                llm_ms = (time.perf_counter() - llm_t0) * 1000.0
                 result = {
                     **(prior or {}),
                     "reply": (
@@ -526,6 +560,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 }
             except Exception:
                 log.exception("Intake turn failed — forcing graceful close")
+                llm_ms = (time.perf_counter() - llm_t0) * 1000.0
                 result = {
                     **(prior or {}),
                     "reply": (
@@ -595,7 +630,11 @@ async def entrypoint(ctx: JobContext) -> None:
                 db.close()
 
             try:
+                tts_t0 = time.perf_counter()
                 synth = await asyncio.wait_for(synth_task, timeout=45.0)
+                tts_synth_ms = (time.perf_counter() - tts_t0) * 1000.0
+                log_latency("tts_synth", tts_synth_ms)
+                play_t0 = time.perf_counter()
                 await asyncio.wait_for(
                     _play_pcm_with_barge_in(
                         ctx.room,
@@ -605,6 +644,16 @@ async def entrypoint(ctx: JobContext) -> None:
                         label="reply",
                     ),
                     timeout=45.0,
+                )
+                tts_play_ms = (time.perf_counter() - play_t0) * 1000.0
+                log_latency("tts_play", tts_play_ms)
+                await _publish_latency(
+                    ctx.room,
+                    stt_ms=stt_ms,
+                    llm_ms=llm_ms,
+                    tts_synth_ms=tts_synth_ms,
+                    tts_play_ms=tts_play_ms,
+                    total_ms=stt_ms + llm_ms + tts_synth_ms,
                 )
             except asyncio.TimeoutError:
                 log.warning("TTS timed out — ending call anyway")

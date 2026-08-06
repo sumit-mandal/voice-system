@@ -137,6 +137,32 @@
     .mode-pill.active-chat { background: #e7f3ec; color: #1f6b4a; }
     .hint { color: var(--muted); font-size: 0.9rem; margin-top: 8px; }
     audio { width: 100%; margin-top: 12px; }
+    #latency {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: #eef2ef;
+      border: 1px dashed var(--line);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    #latency .lat-title {
+      font-weight: 600;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    #latency .lat-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+    }
+    #latency .lat-item strong { color: var(--accent); }
+    #latency .lat-total strong { color: var(--ink); }
   </style>
 </head>
 <body>
@@ -205,6 +231,10 @@
         <button id="btnSendChat" type="button" disabled>Send</button>
       </div>
       <div id="chatStatus" class="hint"></div>
+      <div id="latency">
+        <div class="lat-title">Latency (last turn)</div>
+        <div id="latencyBody" class="hint">Waiting for a turn…</div>
+      </div>
       <div id="log"></div>
     </section>
   </main>
@@ -221,6 +251,7 @@
     const chatInput = document.getElementById("chatInput");
     const chatStatus = document.getElementById("chatStatus");
     const sessionModeEl = document.getElementById("sessionMode");
+    const latencyBody = document.getElementById("latencyBody");
 
     let room = null;
     let activeCallSid = null;
@@ -235,6 +266,34 @@
       const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
       console.log(line);
       logEl.textContent = `${line}\n` + logEl.textContent;
+    }
+
+    function fmtMs(v) {
+      if (v == null || Number.isNaN(Number(v))) return "—";
+      return `${Math.round(Number(v))}ms`;
+    }
+
+    function showLatency(lat) {
+      if (!lat || typeof lat !== "object") return;
+      const parts = [];
+      if (lat.stt_ms != null) parts.push(`<span class="lat-item">STT <strong>${fmtMs(lat.stt_ms)}</strong></span>`);
+      if (lat.llm_ms != null) parts.push(`<span class="lat-item">LLM <strong>${fmtMs(lat.llm_ms)}</strong></span>`);
+      if (lat.tts_synth_ms != null) parts.push(`<span class="lat-item">TTS synth <strong>${fmtMs(lat.tts_synth_ms)}</strong></span>`);
+      if (lat.tts_play_ms != null) parts.push(`<span class="lat-item">TTS play <strong>${fmtMs(lat.tts_play_ms)}</strong></span>`);
+      if (lat.total_ms != null) parts.push(`<span class="lat-item lat-total">Total (to speech) <strong>${fmtMs(lat.total_ms)}</strong></span>`);
+      if (!parts.length) return;
+      latencyBody.innerHTML = `<div class="lat-row">${parts.join("")}</div>`;
+      const summary = [
+        lat.stt_ms != null ? `stt=${fmtMs(lat.stt_ms)}` : null,
+        lat.llm_ms != null ? `llm=${fmtMs(lat.llm_ms)}` : null,
+        lat.tts_synth_ms != null ? `tts=${fmtMs(lat.tts_synth_ms)}` : null,
+        lat.total_ms != null ? `total=${fmtMs(lat.total_ms)}` : null,
+      ].filter(Boolean).join(" ");
+      log(`Latency ${summary}`);
+    }
+
+    function resetLatency() {
+      latencyBody.textContent = "Waiting for a turn…";
     }
 
     function setSessionMode(mode) {
@@ -360,6 +419,7 @@
       chatInput.value = "";
       chatStatus.textContent = "";
       lastTranscript = "";
+      resetLatency();
       convoEl.innerHTML = '<div class="hint">Start voice or chat to begin.</div>';
       document.getElementById("btnStart").disabled = false;
       document.getElementById("btnStartChat").disabled = false;
@@ -516,8 +576,22 @@
             log("TrackUnsubscribed");
           })
           .on(RoomEvent.Disconnected, () => log("Disconnected"))
-          .on(RoomEvent.ParticipantConnected, (p) => log(`ParticipantConnected ${p.identity}`));
+          .on(RoomEvent.ParticipantConnected, (p) => log(`ParticipantConnected ${p.identity}`))
+          .on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+            try {
+              const text = typeof payload === "string"
+                ? payload
+                : new TextDecoder().decode(payload);
+              const msg = JSON.parse(text);
+              if (msg && msg.type === "latency") {
+                showLatency(msg);
+              }
+            } catch (err) {
+              console.warn("data packet parse failed", err);
+            }
+          });
 
+        resetLatency();
         log(`Connecting to ${session.livekit_url}…`);
         await room.connect(session.livekit_url, session.token);
         log("Connected to room");
@@ -614,6 +688,7 @@
         );
         lastTranscript = `assistant: ${body.greeting}\n`;
         renderConversation(lastTranscript);
+        resetLatency();
         startTranscriptPoll(body.call_sid);
         setChatEnabled(true);
         chatStatus.textContent = "Chat ready — type a reply below.";
@@ -702,6 +777,7 @@
 
         lastTranscript = donePayload.transcript || `${lastTranscript}assistant: ${assistantDraft}\n`;
         renderConversation(lastTranscript);
+        if (donePayload.latency) showLatency(donePayload.latency);
         startTranscriptPoll(activeCallSid);
         metaEl.textContent = JSON.stringify(
           {
@@ -711,6 +787,7 @@
             caller_name: donePayload.caller_name,
             child_first_name: donePayload.child_first_name,
             primary_disposition: donePayload.primary_disposition,
+            latency: donePayload.latency || null,
           },
           null,
           2
