@@ -321,11 +321,17 @@
         return;
       }
       // Repair legacy rows where separately persisted role lines were concatenated.
-      const lines = (transcript || "")
+      const rawLines = (transcript || "")
         .replace(/(assistant:|user:)/g, "\n$1")
         .split("\n")
         .map((line) => line.trim())
         .filter(Boolean);
+      // Drop consecutive duplicate turns (legacy save_to_db + append race).
+      const lines = [];
+      for (const line of rawLines) {
+        if (lines.length && lines[lines.length - 1] === line) continue;
+        lines.push(line);
+      }
       const html = lines.map((line) => {
         const isUser = line.startsWith("user:");
         const isAsst = line.startsWith("assistant:");

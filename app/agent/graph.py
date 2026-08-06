@@ -669,9 +669,8 @@ def save_to_db(state: IntakeState) -> IntakeState:
 
     db = SessionLocal()
     try:
-        transcript = "\n".join(
-            f"{m['role']}: {m['content']}" for m in (state.get("messages") or [])
-        )
+        # Transcript is append-only from voice/chat handlers. Writing messages here
+        # then appending the reply again duplicated the latest Ava turn in the UI.
         repo.update_intake(
             db,
             call_sid=state["call_sid"],
@@ -680,7 +679,7 @@ def save_to_db(state: IntakeState) -> IntakeState:
             ready_to_proceed=state.get("ready_to_proceed"),
             diseases=state.get("diseases") or state.get("diagnosis_stated"),
             medications=state.get("medications") or state.get("insurance_carrier"),
-            transcript=transcript,
+            transcript=None,
             status=status,
             handoff_reason=state.get("handoff_reason") or None,
             handoff_summary=state.get("handoff_summary") or None,
