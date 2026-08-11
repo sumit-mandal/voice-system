@@ -84,3 +84,5 @@ class IntakeState(TypedDict):
     ready_to_proceed: bool | None
     diseases: str | None
     medications: str | None
+    caller_ended: bool
+    utterance_unclear: bool

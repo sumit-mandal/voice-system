@@ -32,7 +32,9 @@ class Settings(BaseSettings):
     nvidia_max_tokens: int = 1024
     nvidia_seed: int = 42
 
-    database_url: str = "sqlite:///./data/healthcare_voice.db"
+    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/voice_system"
+    db_pool_size: int = 5
+    db_max_overflow: int = 10
     # Seeded into clinic_settings on first init_db only (DB remains source of truth).
     clinic_name: str = "Our Clinic"
 

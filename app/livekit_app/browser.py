@@ -146,6 +146,8 @@ def _browser_livekit_url(settings) -> str:
 def _chat_status(result: IntakeState) -> str:
     if result.get("handoff_requested"):
         return "handoff_pending"
+    if result.get("caller_ended"):
+        return "paused"
     if result.get("is_complete") or result.get("should_end"):
         return "complete"
     return "in_progress"

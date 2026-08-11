@@ -1,6 +1,6 @@
 # Healthcare Voice Intake
 
-Inbound phone intake: **Twilio → self-hosted LiveKit (OSS) → FastAPI/LangGraph → PocketTTS + faster-whisper → SQLite**.
+Inbound phone intake: **Twilio → self-hosted LiveKit (OSS) → FastAPI/LangGraph → PocketTTS + faster-whisper → PostgreSQL**.
 
 This project targets **open-source LiveKit** via Docker — not LiveKit Cloud.
 
@@ -15,7 +15,7 @@ This project targets **open-source LiveKit** via Docker — not LiveKit Cloud.
 | LangGraph + ChatNVIDIA | Slot-filling + clarification |
 | faster-whisper | STT |
 | PocketTTS | TTS |
-| SQLite | Persist name, age, transcript |
+| PostgreSQL | Persist name, age, transcript |
 | Human handoff | LangGraph detects intent → Twilio cold-transfers to `TWILIO_HUMAN_AGENT_NUMBER` |
 | Email agent | SES + LangGraph classify/tools → SES auto-reply (`POST /email/debug`) |
 
@@ -145,6 +145,6 @@ app/
   voice/                  faster-whisper + PocketTTS
   livekit_app/            room helpers + worker
   twilio_app/             inbound webhooks
-  db/                     SQLite
+  db/                     PostgreSQL models + repositories
 docker-compose.yml        OSS LiveKit + Redis
 ```

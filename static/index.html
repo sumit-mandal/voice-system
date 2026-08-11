@@ -556,6 +556,23 @@
         btnStart.disabled = true;
         document.getElementById("btnStartChat").disabled = true;
         setSessionMode("voice");
+
+        // Check mic availability before provisioning a room/DB session, so a
+        // non-secure origin doesn't leave an orphaned in_progress call record.
+        if (!window.isSecureContext) {
+          throw new Error(
+            `Mic requires a secure context, but this page is "${window.location.origin}". ` +
+              "Open http://localhost:8000 in Chrome/Safari (not Cursor's Simple Browser, " +
+              "and not a LAN IP over http)."
+          );
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error(
+            "navigator.mediaDevices.getUserMedia is unavailable. " +
+              "Use Chrome/Safari at http://localhost:8000 and allow microphone access."
+          );
+        }
+
         log("Requesting browser session…");
         const res = await fetch("/browser/session", { method: "POST" });
         if (!res.ok) throw new Error(await res.text());
@@ -601,19 +618,6 @@
         log(`Connecting to ${session.livekit_url}…`);
         await room.connect(session.livekit_url, session.token);
         log("Connected to room");
-
-        if (!window.isSecureContext) {
-          throw new Error(
-            "Mic requires a secure context. Open http://localhost:8000 in Chrome/Safari " +
-              "(not Cursor Simple Browser, and not a LAN IP over http)."
-          );
-        }
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          throw new Error(
-            "navigator.mediaDevices.getUserMedia is unavailable. " +
-              "Use Chrome/Safari at http://localhost:8000 and allow microphone access."
-          );
-        }
 
         // Prefer LiveKit helper; fall back to createLocalAudioTrack.
         if (typeof room.localParticipant.setMicrophoneEnabled === "function") {

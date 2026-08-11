@@ -106,7 +106,7 @@ def health() -> dict[str, str]:
 
 @app.post("/debug/chat", response_model=DebugChatResponse)
 def debug_chat(body: DebugChatRequest, db: Session = Depends(get_db)) -> DebugChatResponse:
-    """Text-only path to exercise LangGraph + SQLite without Twilio/LiveKit."""
+    """Text-only path to exercise LangGraph + Postgres without Twilio/LiveKit."""
     log.info(
         "POST /debug/chat | call_sid=%s reset=%s text=%r",
         body.call_sid,

@@ -40,7 +40,7 @@ _DISPOSITIONS = {
     "Safety Stop",
     "Verification Failed",
 }
-_MAX_UNCLEAR = 1  # after one unclear retry, skip field
+_MAX_UNCLEAR_TRIES = 2  # two failed answers on a field before skip + announce next
 _MAX_TURNS = 40  # emergency cap only; normal completion follows the full checklist
 _FIELD_SKIP_ORDER = [
     "caller_name",
@@ -136,6 +136,7 @@ def _snapshot(state: IntakeState) -> dict[str, Any]:
         "primary_disposition": state.get("primary_disposition"),
         "intake_complete": state.get("intake_complete"),
         "pending_field": state.get("pending_field"),
+        "unclear_streak": state.get("unclear_streak") or 0,
         "capture": state.get("capture") or {},
     }
 
@@ -233,34 +234,45 @@ def _graceful_close_reply(*, caller_name: str | None, child_first: str | None) -
     )
 
 
-def _is_repeat_ask(reply: str) -> bool:
-    low = reply.lower()
-    return any(
-        p in low
-        for p in (
-            "didn't quite catch",
-            "did not catch",
-            "could you please repeat",
-            "can you repeat",
-            "say that again",
-            "could you repeat",
-            "i didn't catch",
-            "i could not understand",
-            "please repeat",
-        )
+def _partial_close_reply(*, caller_name: str | None) -> str:
+    thanks = f"Thanks{', ' + caller_name if caller_name else ''}."
+    return (
+        f"{thanks} I've saved everything we've collected so far for the care team. "
+        "When you call or email again from this number or email, we can pick up "
+        f"from here. Someone will follow up within {LIVE_FACTS['BENEFITS_SLA']} "
+        "if needed. Goodbye."
     )
 
 
-def _next_field_after(pending: str | None) -> str | None:
-    if not pending:
-        return "close"
-    try:
-        idx = _FIELD_SKIP_ORDER.index(pending)
-    except ValueError:
-        return "close"
-    if idx + 1 >= len(_FIELD_SKIP_ORDER):
-        return None
-    return _FIELD_SKIP_ORDER[idx + 1]
+def prompt_for_pending(pending: str | None) -> str:
+    """Spoken re-ask for a pending checklist field (also used by the voice worker)."""
+    if not pending or pending in {"recording_notice", "close"}:
+        return "Sorry, I didn't catch that. Could you say that again?"
+    return _FIELD_PROMPTS.get(
+        pending,
+        "Sorry, I didn't catch that. Could you say that again?",
+    )
+
+
+def _ensure_pending_reask(reply: str, pending: str | None) -> str:
+    """Keep model wording when it already asks a question; otherwise append the field ask."""
+    prompt = prompt_for_pending(pending)
+    base = (reply or "").strip()
+    if not base:
+        return prompt
+    if "?" in base:
+        return base
+    return f"{base} {prompt}"
+
+
+def _skip_field_reply(*, skipped: str, next_pending: str | None) -> str:
+    label = skipped.replace("_", " ")
+    next_q = prompt_for_pending(next_pending)
+    return (
+        f"I'm sorry, I still didn't get your {label} clearly after a couple of tries, "
+        f"so I'll leave that for the care team and move on. {next_q}"
+    )
+
 
 def _apply_verification(state: IntakeState, data: dict[str, Any]) -> tuple[bool, str, str | None]:
     """Return (verified, continuity_block, possibly_updated_user_id)."""
@@ -359,32 +371,19 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         )
         data = _parse_llm_json(raw)
     except Exception:
-        # Never stall on LLM/STT garbage — skip current field and keep moving
-        log.exception("LLM extract failed — advancing with safe defaults")
-        next_field = _next_field_after(state.get("pending_field"))
-        skipped_fields = list((state.get("capture") or {}).get("skipped_fields") or [])
-        current_field = state.get("pending_field")
-        if current_field and current_field not in {"recording_notice", "close"}:
-            skipped_fields.append(current_field)
-        if next_field in (None, "close"):
-            data = {
-                "reply": "",
-                "pending_field": None,
-                "capture": {"skipped_fields": skipped_fields},
-                "primary_disposition": "Callback Queue",
-                "is_complete": True,
-                "should_end": True,
-                "handoff_requested": False,
-            }
-        else:
-            data = {
-                "reply": "",
-                "pending_field": next_field,
-                "capture": {"skipped_fields": skipped_fields},
-                "is_complete": False,
-                "should_end": False,
-                "handoff_requested": False,
-            }
+        # Keep the same pending field and ask again — do not auto-skip on LLM failure.
+        log.exception("LLM extract failed — re-asking current pending field")
+        pending = state.get("pending_field")
+        data = {
+            "reply": prompt_for_pending(pending),
+            "pending_field": pending,
+            "capture": state.get("capture") or {},
+            "is_complete": False,
+            "should_end": False,
+            "handoff_requested": False,
+            "caller_ended": False,
+            "utterance_unclear": True,
+        }
 
     verified, continuity_block, resolved_user_id = _apply_verification(state, data)
 
@@ -488,8 +487,12 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
     turn_count = int(state.get("turn_count") or 0) + 1
     unclear_streak = int(state.get("unclear_streak") or 0)
     prior_pending = state.get("pending_field")
+    caller_ended = bool(data.get("caller_ended"))
+    utterance_unclear = bool(data.get("utterance_unclear"))
 
     if handoff_requested:
+        caller_ended = False
+        utterance_unclear = False
         should_end = True
         is_complete = False
         pending = None
@@ -500,26 +503,66 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
             disposition = "Warm Transfer"
         handoff_summary = _build_handoff_summary(state, data)
         reply = _nonempty_text(data.get("reply")) or _DEFAULT_HANDOFF_REPLY
+    elif caller_ended:
+        utterance_unclear = False
+        should_end = True
+        is_complete = False
+        intake_complete = False
+        pending = None
+        unclear_streak = 0
+        disposition = disposition or "Callback Queue"
+        model_reply = _nonempty_text(data.get("reply"))
+        # Prefer model close when it does not ask another question.
+        if model_reply and "?" not in model_reply:
+            reply = model_reply
+        else:
+            reply = _partial_close_reply(caller_name=caller_name)
+        log.info(
+            "Caller ended early | call_sid=%s pending_was=%r",
+            state["call_sid"],
+            prior_pending,
+        )
     else:
         reply = str(data.get("reply") or "")
-        is_repeat_ask = _is_repeat_ask(reply) if reply else False
 
-        # Track unclear retries on the same pending field
-        if is_repeat_ask and pending_in and pending_in == prior_pending:
+        # Count failed answers from utterance_unclear only (prompt-driven; no phrase matching).
+        if utterance_unclear and prior_pending not in {None, "close", "recording_notice"}:
             unclear_streak += 1
-        elif pending_in != prior_pending:
+            pending_in = prior_pending
+        elif pending_in != prior_pending and not utterance_unclear:
             unclear_streak = 0
 
-        # After one unclear retry, skip the field and move on
-        if unclear_streak > _MAX_UNCLEAR and pending_in not in {None, "close"}:
-            skipped = pending_in
-            skipped_fields = list(capture.get("skipped_fields") or [])
+        skipped_fields = list(capture.get("skipped_fields") or [])
+        # Enforce minimum two tries: undo premature model skips while still clarifying.
+        if (
+            prior_pending
+            and prior_pending in skipped_fields
+            and unclear_streak < _MAX_UNCLEAR_TRIES
+            and utterance_unclear
+        ):
+            skipped_fields = [f for f in skipped_fields if f != prior_pending]
+            capture["skipped_fields"] = skipped_fields
+            checklist_details["capture"] = capture
+
+        # After two unclear tries, skip and clearly announce the next question.
+        if (
+            utterance_unclear
+            and unclear_streak >= _MAX_UNCLEAR_TRIES
+            and prior_pending not in {None, "close", "recording_notice"}
+        ):
+            skipped = prior_pending
             if skipped not in skipped_fields:
                 skipped_fields.append(skipped)
             capture["skipped_fields"] = skipped_fields
+            checklist_details["capture"] = capture
             pending = _next_required_field(**checklist_details)
             unclear_streak = 0
-            log.info("Skipping unclear field | skipped=%s next=%s", skipped, pending)
+            utterance_unclear = False
+            log.info(
+                "Skipping unclear field after 2 tries | skipped=%s next=%s",
+                skipped,
+                pending,
+            )
             if pending == "close" or pending is None:
                 disposition = disposition or "Callback Queue"
                 is_complete = True
@@ -528,20 +571,32 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
                     caller_name=caller_name, child_first=child_first
                 )
             else:
-                reply = (
-                    "No problem, we'll leave that for the care team to confirm. "
-                    + _FIELD_PROMPTS.get(
-                        str(pending),
-                        "Let's keep going. What else should I capture for intake?",
+                model_reply = _nonempty_text(data.get("reply"))
+                if model_reply and "?" in model_reply:
+                    reply = model_reply
+                else:
+                    reply = _skip_field_reply(
+                        skipped=str(skipped), next_pending=str(pending)
                     )
-                )
 
-        # Accept insurance answers without re-asking, then continue the checklist.
-        elif carrier and (
-            pending_in == "insurance"
-            or (is_repeat_ask and prior_pending == "insurance")
-        ):
+        elif utterance_unclear and prior_pending not in {
+            None,
+            "close",
+            "recording_notice",
+        }:
+            should_end = False
+            is_complete = False
+            pending = prior_pending
+            reply = _ensure_pending_reask(reply, prior_pending)
+            log.info(
+                "Unclear utterance — re-asking pending | pending=%s streak=%s",
+                pending,
+                unclear_streak,
+            )
+
+        elif carrier and pending_in == "insurance":
             unclear_streak = 0
+            utterance_unclear = False
             pending = _next_required_field(**checklist_details)
             if pending == "close":
                 disposition = disposition or "Callback Queue"
@@ -552,11 +607,9 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
                     caller_name=caller_name, child_first=child_first
                 )
             else:
-                reply = f"Got it — {carrier}. " + _FIELD_PROMPTS[pending]
+                reply = f"Got it — {carrier}. " + prompt_for_pending(pending)
 
         else:
-            # A normal close is allowed only after every checklist field was handled.
-            model_complete = bool(data.get("is_complete") and disposition)
             next_required = _next_required_field(**checklist_details)
             checklist_complete = next_required == "close"
             if checklist_complete:
@@ -565,13 +618,13 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
                 should_end = True
                 pending = None
                 unclear_streak = 0
+                utterance_unclear = False
                 if intake_complete is None:
                     intake_complete = True
                 reply = _graceful_close_reply(
                     caller_name=caller_name, child_first=child_first
                 )
             else:
-                # Override premature model closure and keep the interview flowing.
                 should_end = False
                 is_complete = False
                 disposition = None
@@ -580,16 +633,17 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
                     not reply
                     or data.get("should_end")
                     or data.get("is_complete")
+                    or data.get("caller_ended")
                     or pending_in != next_required
                 ):
-                    reply = _FIELD_PROMPTS[next_required]
+                    reply = prompt_for_pending(next_required)
 
-        # Hard turn cap — never leave a call hanging
         if not should_end and turn_count >= _MAX_TURNS:
             disposition = disposition or "Callback Queue"
             is_complete = True
             should_end = True
             pending = None
+            caller_ended = False
             reply = _graceful_close_reply(
                 caller_name=caller_name, child_first=child_first
             )
@@ -643,13 +697,17 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         "ready_to_proceed": True if is_complete else state.get("ready_to_proceed"),
         "diseases": diseases,
         "medications": medications,
+        "caller_ended": caller_ended,
+        "utterance_unclear": utterance_unclear,
     }
     log.info(
-        "extract_and_validate done | complete=%s should_end=%s handoff=%s disposition=%s "
-        "verified=%s child=%r reply=%r",
+        "extract_and_validate done | complete=%s should_end=%s handoff=%s caller_ended=%s "
+        "unclear=%s disposition=%s verified=%s child=%r reply=%r",
         updated["is_complete"],
         updated["should_end"],
         updated["handoff_requested"],
+        updated["caller_ended"],
+        updated["utterance_unclear"],
         updated["primary_disposition"],
         updated["identity_verified"],
         updated["child_first_name"],
@@ -662,7 +720,11 @@ def save_to_db(state: IntakeState) -> IntakeState:
     log.debug("NODE save_to_db | call_sid=%s user_id=%s", state["call_sid"], state.get("user_id"))
     if state.get("handoff_requested"):
         status = "handoff_pending"
+    elif state.get("caller_ended"):
+        status = "paused"
     elif state.get("is_complete"):
+        status = "complete"
+    elif state.get("should_end"):
         status = "complete"
     else:
         status = "in_progress"
@@ -855,6 +917,8 @@ def _initial_state(call_sid: str, user_text: str) -> IntakeState:
         "ready_to_proceed": None,
         "diseases": None,
         "medications": None,
+        "caller_ended": False,
+        "utterance_unclear": False,
     }
 
 
@@ -889,6 +953,8 @@ def run_intake_turn(
             "handoff_requested": False,
             "handoff_reason": "",
             "handoff_summary": "",
+            "caller_ended": False,
+            "utterance_unclear": False,
         }
     result = graph.invoke(state)
     log.debug("run_intake_turn result | %s", result)

@@ -81,30 +81,30 @@ def chat_completion(messages: list[dict[str, str]]) -> str:
     return content
 
 
-def chat_completion_stream(messages: list[dict[str, str]]) -> Iterator[str]:
-    """Yield text deltas from Gemini as they arrive (for low perceived latency)."""
-    settings = get_settings()
-    llm = build_llm()
-    log.debug(
-        "chat_completion_stream (Gemini) | model=%s messages=%s",
-        settings.gemini_model,
-        len(messages),
-    )
-    t0 = time.perf_counter()
-    first = True
-    for chunk in llm.stream(_to_lc_messages(messages)):
-        if first:
-            log_latency(
-                "llm_ttft",
-                (time.perf_counter() - t0) * 1000.0,
-                model=settings.gemini_model,
-            )
-            first = False
-        content = chunk.content
-        if content is None:
-            continue
-        if not isinstance(content, str):
-            content = str(content)
-        if content:
-            yield content
-    log_latency("llm_stream_total", (time.perf_counter() - t0) * 1000.0, model=settings.gemini_model)
+# def chat_completion_stream(messages: list[dict[str, str]]) -> Iterator[str]:
+#     """Yield text deltas from Gemini as they arrive (for low perceived latency)."""
+#     settings = get_settings()
+#     llm = build_llm()
+#     log.debug(
+#         "chat_completion_stream (Gemini) | model=%s messages=%s",
+#         settings.gemini_model,
+#         len(messages),
+#     )
+#     t0 = time.perf_counter()
+#     first = True
+#     for chunk in llm.stream(_to_lc_messages(messages)):
+#         if first:
+#             log_latency(
+#                 "llm_ttft",
+#                 (time.perf_counter() - t0) * 1000.0,
+#                 model=settings.gemini_model,
+#             )
+#             first = False
+#         content = chunk.content
+#         if content is None:
+#             continue
+#         if not isinstance(content, str):
+#             content = str(content)
+#         if content:
+#             yield content
+#     log_latency("llm_stream_total", (time.perf_counter() - t0) * 1000.0, model=settings.gemini_model)

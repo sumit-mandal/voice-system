@@ -9,8 +9,6 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 data/
-*.db
-*.sqlite3
 .DS_Store
 logs/
 *.wav

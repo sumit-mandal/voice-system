@@ -50,7 +50,7 @@ Latest user message:
 
 Speak the next Ava reply now (plain text only)."""
 
-    log.debug("stream_spoken_reply | pending=%r user=%r", pending_field, user_text[:120])
+    log.debug("stream_spoken_reply | pending=%r user=%r", pending_field, user_text[120])
     for delta in chat_completion_stream(
         [
             {"role": "system", "content": system},

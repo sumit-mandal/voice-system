@@ -13,7 +13,7 @@ import numpy as np
 from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 
-from app.agent.graph import run_intake_turn, seed_prior_after_greeting
+from app.agent.graph import prompt_for_pending, run_intake_turn, seed_prior_after_greeting
 from app.agent.state import IntakeState
 from app.config import get_settings
 from app.continuity.ava.policy import phone_greeting
@@ -457,7 +457,10 @@ async def entrypoint(ctx: JobContext) -> None:
                     _save_transcript_line(call_sid, f"assistant: {bye}")
                     await _publish_tts_with_barge_in(ctx.room, bye, mic)
                     break
-                nudge = "Sorry, I did not catch that. Please continue."
+                nudge = (
+                    "Sorry, I did not catch that. "
+                    + prompt_for_pending((prior or {}).get("pending_field"))
+                )
                 _save_transcript_line(call_sid, f"assistant: {nudge}")
                 await _publish_tts_with_barge_in(ctx.room, nudge, mic)
                 continue
@@ -504,7 +507,10 @@ async def entrypoint(ctx: JobContext) -> None:
                     _save_transcript_line(call_sid, f"assistant: {bye}")
                     await _publish_tts_with_barge_in(ctx.room, bye, mic)
                     break
-                nudge = "I could not understand. Let's move on — please continue."
+                nudge = (
+                    "Sorry, I could not understand. "
+                    + prompt_for_pending((prior or {}).get("pending_field"))
+                )
                 _save_transcript_line(call_sid, f"assistant: {nudge}")
                 await _publish_tts_with_barge_in(ctx.room, nudge, mic)
                 continue
@@ -523,7 +529,10 @@ async def entrypoint(ctx: JobContext) -> None:
                     _save_transcript_line(call_sid, f"assistant: {bye}")
                     await _publish_tts_with_barge_in(ctx.room, bye, mic)
                     break
-                nudge = "I could not understand. Please continue with the next detail."
+                nudge = (
+                    "Sorry, I could not understand. "
+                    + prompt_for_pending((prior or {}).get("pending_field"))
+                )
                 _save_transcript_line(call_sid, f"assistant: {nudge}")
                 await _publish_tts_with_barge_in(ctx.room, nudge, mic)
                 continue
@@ -608,6 +617,8 @@ async def entrypoint(ctx: JobContext) -> None:
                 status = "in_progress"
                 if result.get("handoff_requested"):
                     status = "handoff_pending"
+                elif result.get("caller_ended"):
+                    status = "paused"
                 elif result.get("is_complete") or result.get("should_end"):
                     status = "complete"
                 repo.update_intake(
