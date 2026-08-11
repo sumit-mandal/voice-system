@@ -14,37 +14,51 @@ from app.logging_setup import get_logger
 
 log = get_logger(__name__)
 
-_LLM: ChatGoogleGenerativeAI | None = None
+_LLM: dict[tuple[str, bool], ChatGoogleGenerativeAI] = {}
 
 
-def build_llm() -> ChatGoogleGenerativeAI:
-    global _LLM
+def build_llm(*, json_mode: bool = False) -> ChatGoogleGenerativeAI:
     get_settings.cache_clear()
     settings = get_settings()
 
-    if _LLM is not None:
-        current = getattr(_LLM, "model", None) or getattr(_LLM, "model_name", None)
-        if current == settings.gemini_model:
-            log.debug("Reusing cached ChatGoogleGenerativeAI | model=%s", current)
-            return _LLM
-        log.info("Gemini model changed %s → %s — rebuilding client", current, settings.gemini_model)
+    cache_key = (settings.gemini_model, json_mode)
+    cached = _LLM.get(cache_key)
+    if cached is not None:
+        return cached
 
     log.debug(
-        "Building Gemini | model=%s temp=%s top_p=%s max_tokens=%s",
+        "Building Gemini | model=%s temp=%s top_p=%s max_tokens=%s json_mode=%s",
         settings.gemini_model,
         settings.gemini_temperature,
         settings.gemini_top_p,
         settings.gemini_max_tokens,
+        json_mode,
     )
-    _LLM = ChatGoogleGenerativeAI(
-        model=settings.gemini_model,
-        google_api_key=settings.gemini_api_key,
-        temperature=settings.gemini_temperature,
-        top_p=settings.gemini_top_p,
-        max_output_tokens=settings.gemini_max_tokens,
-    )
-    log.info("Gemini client ready | model=%s", settings.gemini_model)
-    return _LLM
+    kwargs: dict[str, object] = {
+        "model": settings.gemini_model,
+        "google_api_key": settings.gemini_api_key,
+        "temperature": settings.gemini_temperature,
+        "top_p": settings.gemini_top_p,
+        "max_output_tokens": settings.gemini_max_tokens,
+    }
+    # Thinking tokens come out of the same budget and truncate long JSON replies.
+    optional = {"thinking_budget": settings.gemini_thinking_budget}
+    if json_mode:
+        optional["response_mime_type"] = "application/json"
+
+    try:
+        client = ChatGoogleGenerativeAI(**kwargs, **optional)
+    except (TypeError, ValueError):
+        log.warning(
+            "Gemini client rejected optional args %s — falling back",
+            sorted(optional),
+            exc_info=True,
+        )
+        client = ChatGoogleGenerativeAI(**kwargs)
+
+    _LLM[cache_key] = client
+    log.info("Gemini client ready | model=%s json_mode=%s", settings.gemini_model, json_mode)
+    return client
 
 
 def _to_lc_messages(messages: list[dict[str, str]]) -> list:
@@ -61,20 +75,29 @@ def _to_lc_messages(messages: list[dict[str, str]]) -> list:
     return lc_messages
 
 
-def chat_completion(messages: list[dict[str, str]]) -> str:
+def chat_completion(messages: list[dict[str, str]], *, json_mode: bool = False) -> str:
     """Run a chat completion and return assistant text."""
     settings = get_settings()
-    llm = build_llm()
+    llm = build_llm(json_mode=json_mode)
     log.debug(
-        "chat_completion (Gemini) | model=%s messages=%s",
+        "chat_completion (Gemini) | model=%s messages=%s json_mode=%s",
         settings.gemini_model,
         len(messages),
+        json_mode,
     )
 
     t0 = time.perf_counter()
     response = llm.invoke(_to_lc_messages(messages))
     log_latency("llm", (time.perf_counter() - t0) * 1000.0, model=settings.gemini_model)
     content = response.content if isinstance(response.content, str) else str(response.content)
+    finish_reason = (response.response_metadata or {}).get("finish_reason")
+    if finish_reason and str(finish_reason).upper() not in {"STOP", "1"}:
+        log.warning(
+            "Gemini stopped early | finish_reason=%s chars=%s max_tokens=%s",
+            finish_reason,
+            len(content),
+            settings.gemini_max_tokens,
+        )
     log.debug("Gemini content | %r", content[:1200])
     if not content.strip():
         raise ValueError("Gemini returned empty content")

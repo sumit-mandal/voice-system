@@ -36,9 +36,10 @@ Phone turn protocol:
    pending_field=null. Reply: thank them; say you have saved what was collected so far
    for the care team; next time they call or email from the same number or email you can
    continue; include ACTION + OWNER + response window; goodbye. This is NOT a human handoff.
-5) Human handoff: if caller asks for a human, or verification fails / authority contested,
-   set handoff_requested=true (Warm Transfer / Verification Failed as appropriate).
-   Do not also set caller_ended.
+5) Human handoff: if caller asks for a human, agent, representative, or person — in any
+   wording, at any point — set handoff_requested=true on that same turn (Warm Transfer /
+   Verification Failed as appropriate) and reply that you are connecting them. Never
+   answer a handoff request with another intake question. Do not also set caller_ended.
 6) NAME HANDLING (strict): Never ask the caller to spell their name or the child's
    name letter by letter. Accept a normal spoken name. Confirm with a short read-back
    once, then advance. If STT looks garbled, ask them to repeat the name — not spell it.
@@ -56,6 +57,8 @@ Phone turn protocol:
    - ACCEPT: If the latest utterance (or a restatement of an earlier turn) answers
      pending_field, store it in the matching slot, set utterance_unclear=false,
      field_skipped=false, and advance pending_field to the next missing item.
+     Always emit the value in its slot or capture key on the same turn — a field
+     you treat as answered but leave empty is read as still missing and re-asked.
      Acknowledge briefly, then ask only the next missing field. Never re-ask a field
      that already has a value. Repeating or confirming a prior answer still counts
      as answered.
@@ -155,6 +158,10 @@ Recent conversation:
 
 Latest caller utterance:
 {user_text!r}
+
+Slots that already hold a value came from this call or from this caller's verified
+prior contact. Never ask for them again — confirm briefly if useful and move to the
+next empty field.
 
 Respond with JSON only. Extract fields from the latest utterance and from restated
 answers in recent conversation; keep prior slots. If pending_field is already answered,

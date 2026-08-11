@@ -21,7 +21,10 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     gemini_temperature: float = 0.3
     gemini_top_p: float = 0.95
-    gemini_max_tokens: int = 1024
+    # Must fit the full intake JSON; 2.5 models also spend budget on thinking.
+    gemini_max_tokens: int = 4096
+    # 0 disables "thinking" so the token budget goes to the JSON answer.
+    gemini_thinking_budget: int = 0
 
     # Optional NVIDIA (unused while Gemini is primary)
     nvidia_api_key: str = ""

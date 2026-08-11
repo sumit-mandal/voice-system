@@ -86,19 +86,65 @@ _FIELD_PROMPTS = {
 }
 
 
+def _close_truncated_json(text: str) -> str:
+    """Best-effort repair for a response cut off mid-object (token budget hit)."""
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+        out.append(ch)
+
+    if in_string:
+        if escaped:
+            out.pop()
+        out.append('"')
+    repaired = "".join(out).rstrip()
+    # Drop a dangling key or comma that has no value yet.
+    repaired = re.sub(r",\s*$", "", repaired)
+    repaired = re.sub(r',\s*"[^"]*"\s*:\s*$', "", repaired)
+    repaired = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", repaired)
+    repaired = re.sub(r":\s*$", ": null", repaired)
+    return repaired + "".join(reversed(stack))
+
+
 def _parse_llm_json(raw: str) -> dict[str, Any]:
     log.debug("Parsing LLM JSON | raw_len=%s raw=%r", len(raw), raw[:800])
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = _JSON_RE.search(text)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+    candidates = [text]
+    match = _JSON_RE.search(text)
+    if match:
+        candidates.append(match.group(0))
+    candidates.extend(_close_truncated_json(c) for c in list(candidates))
+
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    if last_error is not None:
+        raise last_error
+    raise ValueError("LLM response was not a JSON object")
 
 
 def _nonempty_text(value: Any) -> str | None:
@@ -300,66 +346,6 @@ def prompt_for_pending(
     return _FIELD_PROMPTS.get(pending, "")
 
 
-def _apply_utterance_to_pending(
-    pending: str | None,
-    utterance: str,
-    slots: dict[str, Any],
-    capture: dict[str, Any],
-) -> None:
-    """If the model treated the turn as an answer but left the slot empty, store the utterance."""
-    text = (utterance or "").strip()
-    if not text or not pending or pending in {"recording_notice", "close"}:
-        return
-    if pending == "caller_name" and not slots.get("caller_name"):
-        slots["caller_name"] = text
-    elif pending == "relationship" and not slots.get("relationship"):
-        slots["relationship"] = text
-    elif pending == "callback" and not slots.get("callback"):
-        slots["callback"] = text
-    elif pending == "child_name":
-        if not slots.get("child_first"):
-            parts = text.split()
-            slots["child_first"] = parts[0]
-            if len(parts) > 1 and not slots.get("child_last"):
-                slots["child_last"] = " ".join(parts[1:])
-        elif not slots.get("child_last"):
-            slots["child_last"] = text
-    elif pending == "child_dob" and not slots.get("child_dob"):
-        slots["child_dob"] = text
-    elif pending == "location":
-        if not slots.get("home_city"):
-            slots["home_city"] = text
-        if not slots.get("home_zip"):
-            slots["home_zip"] = text
-    elif pending == "diagnosis" and not slots.get("diagnosis"):
-        slots["diagnosis"] = text
-    elif pending == "insurance" and not slots.get("carrier"):
-        slots["carrier"] = text
-    elif pending == "best_callback_time" and not capture.get("best_callback_time"):
-        capture["best_callback_time"] = text
-    elif pending == "language" and not capture.get("preferred_language"):
-        capture["preferred_language"] = text
-        capture.setdefault("interpreter_needed", False)
-    elif pending == "diagnosing_provider":
-        capture.setdefault("diagnosing_provider", text)
-        capture.setdefault("diagnosis_date", text)
-    elif pending == "insurance_plan" and not capture.get("insurance_plan"):
-        capture["insurance_plan"] = text
-    elif pending == "member_id":
-        capture.setdefault("member_id", text)
-        capture.setdefault("subscriber_name", text)
-    elif pending == "services" and not capture.get("services_requested"):
-        capture["services_requested"] = text
-    elif pending == "availability":
-        capture.setdefault("availability", text)
-        capture.setdefault("care_setting", text)
-    elif pending == "consent":
-        capture.setdefault("contact_consent", True)
-        capture.setdefault("safe_contact_method", text)
-    elif pending == "additional_notes" and "additional_notes" not in capture:
-        capture["additional_notes"] = text
-
-
 def _ensure_pending_reask(
     reply: str,
     pending: str | None,
@@ -387,6 +373,55 @@ def _skip_field_reply(
         f"I'm sorry, I still didn't get your {label} clearly after a couple of tries, "
         f"so I'll leave that for the care team and move on. {next_q}"
     )
+
+
+_PROFILE_SLOTS = (
+    "caller_name",
+    "relationship_to_child",
+    "callback_number",
+    "child_first_name",
+    "child_last_name",
+    "child_dob",
+    "child_age_computed",
+    "home_city",
+    "home_zip",
+    "diagnosis_stated",
+    "asd_diagnosis",
+    "insurance_carrier",
+)
+
+
+def _hydrate_from_profile(state: IntakeState, user_id: str | None) -> None:
+    """Carry a verified caller's stored intake forward so known fields are not re-asked."""
+    if not user_id:
+        return
+    db = SessionLocal()
+    try:
+        profile = crepo.profile_to_dict(crepo.get_intake_profile(db, user_id))
+    finally:
+        db.close()
+    if not profile:
+        return
+
+    filled: list[str] = []
+    for slot in _PROFILE_SLOTS:
+        if state.get(slot) in (None, "") and profile.get(slot) not in (None, ""):
+            state[slot] = profile[slot]  # type: ignore[literal-required]
+            filled.append(slot)
+
+    prior_capture = dict(state.get("capture") or {})
+    for key, value in (profile.get("capture") or {}).items():
+        if key not in prior_capture and value is not None:
+            prior_capture[key] = value
+            filled.append(f"capture.{key}")
+    state["capture"] = prior_capture
+
+    if filled:
+        log.info(
+            "Hydrated prior intake for verified caller | user_id=%s fields=%s",
+            user_id,
+            filled,
+        )
 
 
 def _apply_verification(state: IntakeState, data: dict[str, Any]) -> tuple[bool, str, str | None]:
@@ -477,17 +512,20 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         continuity_block=state.get("continuity_block") or "",
         history=state.get("messages") or [],
     )
-    try:
-        raw = chat_completion(
-            [
-                {"role": "system", "content": build_system_prompt()},
-                {"role": "user", "content": user_prompt},
-            ]
-        )
-        data = _parse_llm_json(raw)
-    except Exception:
+    messages = [
+        {"role": "system", "content": build_system_prompt()},
+        {"role": "user", "content": user_prompt},
+    ]
+    data: dict[str, Any] | None = None
+    for attempt in (1, 2):
+        try:
+            raw = chat_completion(messages, json_mode=True)
+            data = _parse_llm_json(raw)
+            break
+        except Exception:
+            log.exception("LLM extract failed | attempt=%s", attempt)
+    if data is None:
         # Keep the same pending field and ask again — do not auto-skip on LLM failure.
-        log.exception("LLM extract failed — re-asking current pending field")
         pending = state.get("pending_field")
         data = {
             "reply": prompt_for_pending(pending, state),
@@ -502,6 +540,8 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         }
 
     verified, continuity_block, resolved_user_id = _apply_verification(state, data)
+    if verified:
+        _hydrate_from_profile(state, resolved_user_id or state.get("user_id"))
 
     def pick(field: str) -> Any:
         incoming = data.get(field)
@@ -524,47 +564,11 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         asd = state.get("asd_diagnosis")
     carrier = _nonempty_text(pick("insurance_carrier"))
 
-    # If model blanked insurance but caller just answered an insurance ask, accept utterance.
     # Prefer explicit pending_field from the model (including null = done) over prior state.
     if "pending_field" in data:
         pending_in = data.get("pending_field")
     else:
         pending_in = state.get("pending_field")
-    user_utt = (state.get("user_text") or "").strip()
-    if not carrier and pending_in == "insurance" and user_utt:
-        # Avoid accepting meta-answers like "what?" / pure fillers
-        low = user_utt.lower()
-        if low not in {"what", "huh", "sorry", "repeat", "pardon"} and len(user_utt) >= 2:
-            carrier = user_utt.rstrip(".")
-
-    # Guard: do not overwrite adult caller_name with the child's name.
-    prior_caller = state.get("caller_name")
-    if (
-        caller_name
-        and child_first
-        and caller_name.strip().lower() == child_first.strip().lower()
-        and prior_caller
-        and prior_caller.strip().lower() != child_first.strip().lower()
-    ):
-        log.warning(
-            "Rejected caller_name==child_first_name mixup | kept caller=%r child=%r",
-            prior_caller,
-            child_first,
-        )
-        caller_name = prior_caller
-    if (
-        caller_name
-        and child_first
-        and caller_name.strip().lower() == child_first.strip().lower()
-        and relationship
-        and relationship.strip().lower()
-        not in {"self", "myself", "patient", "me"}
-    ):
-        # Relative calling: prefer keeping prior caller if any, else clear mistaken overwrite
-        if prior_caller and prior_caller.strip().lower() != child_first.strip().lower():
-            caller_name = prior_caller
-        elif state.get("caller_name"):
-            caller_name = state.get("caller_name")
 
     disposition = _nonempty_text(data.get("primary_disposition")) or state.get(
         "primary_disposition"
@@ -644,7 +648,6 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
     else:
         reply = str(data.get("reply") or "")
         skipped_fields = list(capture.get("skipped_fields") or [])
-        user_utt = (state.get("user_text") or "").strip()
 
         # Voluntary skip — honor immediately; this is not an unclear retry.
         if field_skipped and prior_pending not in {None, "close", "recording_notice"}:
@@ -655,40 +658,6 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
             capture["skipped_fields"] = skipped_fields
             checklist_details["capture"] = capture
             log.info("Caller skipped field | field=%s", prior_pending)
-
-        # Model answered (or advanced) but left the typed slot empty — keep the utterance.
-        # Skip the very first post-greeting ack so it is not stored as a name.
-        prior_turns = int(state.get("turn_count") or 0)
-        if (
-            not utterance_unclear
-            and not field_skipped
-            and prior_pending not in {None, "close", "recording_notice"}
-            and user_utt
-            and not _field_is_collected(str(prior_pending), **checklist_details)
-            and (pending_in != prior_pending or prior_turns >= 1)
-        ):
-            _apply_utterance_to_pending(
-                prior_pending, user_utt, checklist_details, capture
-            )
-            caller_name = checklist_details["caller_name"]
-            relationship = checklist_details["relationship"]
-            callback = checklist_details["callback"]
-            child_first = checklist_details["child_first"]
-            child_last = checklist_details["child_last"]
-            child_dob = checklist_details["child_dob"]
-            home_city = checklist_details["home_city"]
-            home_zip = checklist_details["home_zip"]
-            diagnosis = checklist_details["diagnosis"]
-            carrier = checklist_details["carrier"]
-            checklist_details["capture"] = capture
-            if _field_is_collected(str(prior_pending), **checklist_details):
-                utterance_unclear = False
-                unclear_streak = 0
-                log.info(
-                    "Accepted utterance for pending field | field=%s value=%r",
-                    prior_pending,
-                    user_utt,
-                )
 
         # Count failed answers from utterance_unclear only (prompt-driven; no phrase matching).
         if utterance_unclear and prior_pending not in {None, "close", "recording_notice"}:
@@ -801,12 +770,6 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
                 caller_name=caller_name, child_first=child_first
             )
             log.info("Force-close on turn cap | turn_count=%s", turn_count)
-
-    if state.get("recording_notice_delivered") and utterance_echoes_assistant(
-        reply, state
-    ):
-        log.info("Dropped greeting replay from model reply | call_sid=%s", state["call_sid"])
-        reply = prompt_for_pending(pending or state.get("pending_field"), state)
 
     messages = list(state.get("messages") or [])
     messages.append({"role": "user", "content": state["user_text"]})
