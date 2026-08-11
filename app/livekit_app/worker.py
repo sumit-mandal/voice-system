@@ -13,7 +13,12 @@ import numpy as np
 from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 
-from app.agent.graph import prompt_for_pending, run_intake_turn, seed_prior_after_greeting
+from app.agent.graph import (
+    prompt_for_pending,
+    run_intake_turn,
+    seed_prior_after_greeting,
+    utterance_echoes_assistant,
+)
 from app.agent.state import IntakeState
 from app.config import get_settings
 from app.continuity.ava.policy import phone_greeting
@@ -358,6 +363,31 @@ async def _capture_utterance(mic: MicPump, *, target_rate: int = 16000) -> bytes
     return samples.astype(np.int16).tobytes()
 
 
+async def _settle_mic(mic: MicPump, *, quiet_s: float = 0.35, timeout_s: float = 1.0) -> None:
+    """Drop post-TTS echo before the next listen (common on Twilio handsets)."""
+    mic.clear()
+    quiet_start: float | None = None
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        frame = await mic.get_frame(timeout=0.05)
+        now = time.monotonic()
+        if frame is None:
+            if quiet_start is None:
+                quiet_start = now
+            elif now - quiet_start >= quiet_s:
+                break
+            continue
+        rms = _pcm16_rms(bytes(frame.data))
+        if rms < RMS_SPEECH_THRESHOLD:
+            if quiet_start is None:
+                quiet_start = now
+            elif now - quiet_start >= quiet_s:
+                break
+        else:
+            quiet_start = None
+    mic.clear()
+
+
 def _load_metadata(ctx: JobContext) -> dict[str, Any]:
     raw = ctx.job.metadata or "{}"
     log.debug("Job metadata raw=%r", raw)
@@ -437,6 +467,7 @@ async def entrypoint(ctx: JobContext) -> None:
         greeting = phone_greeting(get_clinic_name())
         await _publish_tts_with_barge_in(ctx.room, greeting, mic)
         _save_transcript_line(call_sid, f"assistant: {greeting}")
+        await _settle_mic(mic)
 
         prior: IntakeState | None = seed_prior_after_greeting(call_sid, greeting)
         stt = get_stt()
@@ -463,21 +494,10 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
                 _save_transcript_line(call_sid, f"assistant: {nudge}")
                 await _publish_tts_with_barge_in(ctx.room, nudge, mic)
+                await _settle_mic(mic)
                 continue
 
-            # Instant filler while STT + LLM run (masks processing latency).
-            filler = _pick_filler()
             filler_task: asyncio.Task[bool] | None = None
-            if filler is not None:
-                phrase, filler_pcm, filler_rate = filler
-                log.info("Playing filler while processing | phrase=%r", phrase)
-                filler_task = asyncio.create_task(
-                    _play_pcm_with_barge_in(
-                        ctx.room, filler_pcm, filler_rate, mic, label="filler"
-                    ),
-                    name="filler-play",
-                )
-
             try:
                 stt_t0 = time.perf_counter()
                 transcript = await asyncio.wait_for(
@@ -492,12 +512,6 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
             except asyncio.TimeoutError:
                 log.warning("STT timed out")
-                if filler_task:
-                    filler_task.cancel()
-                    try:
-                        await filler_task
-                    except asyncio.CancelledError:
-                        pass
                 empty_stt_streak += 1
                 if empty_stt_streak >= max_empty_stt:
                     bye = (
@@ -506,39 +520,42 @@ async def entrypoint(ctx: JobContext) -> None:
                     )
                     _save_transcript_line(call_sid, f"assistant: {bye}")
                     await _publish_tts_with_barge_in(ctx.room, bye, mic)
+                    await _settle_mic(mic)
                     break
-                nudge = (
-                    "Sorry, I could not understand. "
-                    + prompt_for_pending((prior or {}).get("pending_field"), prior)
-                )
-                _save_transcript_line(call_sid, f"assistant: {nudge}")
-                await _publish_tts_with_barge_in(ctx.room, nudge, mic)
                 continue
 
             if not transcript.text:
                 log.warning("STT returned empty text")
-                if filler_task:
-                    filler_task.cancel()
-                    try:
-                        await filler_task
-                    except asyncio.CancelledError:
-                        pass
                 empty_stt_streak += 1
                 if empty_stt_streak >= max_empty_stt:
                     bye = "I'll wrap up for now. Please call back anytime. Goodbye."
                     _save_transcript_line(call_sid, f"assistant: {bye}")
                     await _publish_tts_with_barge_in(ctx.room, bye, mic)
+                    await _settle_mic(mic)
                     break
-                nudge = (
-                    "Sorry, I could not understand. "
-                    + prompt_for_pending((prior or {}).get("pending_field"), prior)
+                continue
+
+            if utterance_echoes_assistant(transcript.text, prior):
+                log.info(
+                    "Ignoring echo of prior assistant speech | text=%r",
+                    transcript.text,
                 )
-                _save_transcript_line(call_sid, f"assistant: {nudge}")
-                await _publish_tts_with_barge_in(ctx.room, nudge, mic)
                 continue
 
             empty_stt_streak = 0
             _save_transcript_line(call_sid, f"user: {transcript.text}")
+
+            # Filler only after a real caller utterance — not on greeting echo.
+            filler = _pick_filler()
+            if filler is not None:
+                phrase, filler_pcm, filler_rate = filler
+                log.info("Playing filler while processing | phrase=%r", phrase)
+                filler_task = asyncio.create_task(
+                    _play_pcm_with_barge_in(
+                        ctx.room, filler_pcm, filler_rate, mic, label="filler"
+                    ),
+                    name="filler-play",
+                )
 
             try:
                 llm_t0 = time.perf_counter()
@@ -658,6 +675,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
                 tts_play_ms = (time.perf_counter() - play_t0) * 1000.0
                 log_latency("tts_play", tts_play_ms)
+                await _settle_mic(mic)
                 await _publish_latency(
                     ctx.room,
                     stt_ms=stt_ms,

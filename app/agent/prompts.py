@@ -22,8 +22,10 @@ def build_system_prompt(clinic_name: str | None = None) -> str:
 
 Phone turn protocol:
 1) If recording_notice_delivered is false, your FIRST spoken content must include the
-   exact recording notice once, then the natural Ava open. Set recording_notice_delivered
-   true in JSON after delivering it.
+   recording notice once, then the natural Ava open. Set recording_notice_delivered
+   true in JSON after delivering it. If recording_notice_delivered is already true,
+   never repeat the recording notice or the opening greeting — continue from
+   pending_field only.
 2) Collect fields one at a time per capture order. Prefer pending_field guidance.
 3) If CONTINUITY says prior contact may exist and identity_verified is false, verify
    before disclosing prior clinical/schedule/coverage details.

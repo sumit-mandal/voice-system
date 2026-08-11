@@ -245,13 +245,44 @@ def _partial_close_reply(*, caller_name: str | None) -> str:
 
 
 def last_assistant_question(state: IntakeState | dict[str, Any] | None) -> str:
-    """Reuse the last spoken assistant turn instead of a canned field script."""
+    """Reuse the last intake question — never the opening greeting/notice."""
     messages = (state or {}).get("messages") or []
     for turn in reversed(messages):
+        if turn.get("role") != "assistant":
+            continue
+        if turn.get("kind") == "greeting":
+            continue
         content = (turn.get("content") or "").strip()
-        if turn.get("role") == "assistant" and content:
+        if content:
             return content
     return "Sorry, I didn't catch that. Could you say that again?"
+
+
+def _token_set(text: str) -> set[str]:
+    return {
+        tok
+        for tok in "".join(ch.lower() if ch.isalnum() else " " for ch in (text or "")).split()
+        if tok
+    }
+
+
+def utterance_echoes_assistant(
+    utterance: str,
+    state: IntakeState | dict[str, Any] | None,
+) -> bool:
+    """True when STT mostly repeats the last assistant turn (phone echo / TTS bleed)."""
+    heard = _token_set(utterance)
+    if len(heard) < 4:
+        return False
+    for turn in reversed((state or {}).get("messages") or []):
+        if turn.get("role") != "assistant":
+            continue
+        prior = _token_set(turn.get("content") or "")
+        if not prior:
+            continue
+        overlap = len(heard & prior) / max(len(heard), 1)
+        return overlap >= 0.55
+    return False
 
 
 def prompt_for_pending(
@@ -774,6 +805,12 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
             )
             log.info("Force-close on turn cap | turn_count=%s", turn_count)
 
+    if state.get("recording_notice_delivered") and utterance_echoes_assistant(
+        reply, state
+    ):
+        log.info("Dropped greeting replay from model reply | call_sid=%s", state["call_sid"])
+        reply = last_assistant_question(state)
+
     messages = list(state.get("messages") or [])
     messages.append({"role": "user", "content": state["user_text"]})
     messages.append({"role": "assistant", "content": reply})
@@ -1057,7 +1094,11 @@ def seed_prior_after_greeting(
     state["recording_notice_delivered"] = True
     state["pending_field"] = "caller_name"
     state["messages"] = [
-        {"role": "assistant", "content": greeting or "How may I help with intake today?"}
+        {
+            "role": "assistant",
+            "content": greeting or "How may I help with intake today?",
+            "kind": "greeting",
+        }
     ]
     return state
 
