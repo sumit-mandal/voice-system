@@ -14,7 +14,6 @@ from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 
 from app.agent.graph import (
-    prompt_for_pending,
     run_intake_turn,
     seed_prior_after_greeting,
     utterance_echoes_assistant,
@@ -36,7 +35,7 @@ log = get_logger(__name__)
 SILENCE_SECONDS = 0.45  # snappy end-of-utterance (was 1.2s — major latency source)
 MAX_UTTERANCE_SECONDS = 12.0 #The system will stop recording after 12 seconds of speech
 MIN_UTTERANCE_SECONDS = 0.45 #The system will not consider the speech to be valid if it is less than 0.45 seconds
-RMS_SPEECH_THRESHOLD = 250.0 #The system will consider the speech to be valid if it is greater than 250.0 decibels
+RMS_SPEECH_THRESHOLD = 120.0  # phone/SIP levels are often quieter than browser mic
 # Barge-in: slightly higher + sustained frames so TTS speaker echo is less likely.
 BARGE_IN_RMS = 400.0
 BARGE_IN_MIN_FRAMES = 6  # ~120ms at 20ms/frame
@@ -363,28 +362,12 @@ async def _capture_utterance(mic: MicPump, *, target_rate: int = 16000) -> bytes
     return samples.astype(np.int16).tobytes()
 
 
-async def _settle_mic(mic: MicPump, *, quiet_s: float = 0.35, timeout_s: float = 1.0) -> None:
-    """Drop post-TTS echo before the next listen (common on Twilio handsets)."""
+async def _settle_mic(mic: MicPump, *, tail_s: float = 0.4) -> None:
+    """Discard a short post-TTS echo tail. Do not wait for the caller to finish talking."""
     mic.clear()
-    quiet_start: float | None = None
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + tail_s
     while time.monotonic() < deadline:
-        frame = await mic.get_frame(timeout=0.05)
-        now = time.monotonic()
-        if frame is None:
-            if quiet_start is None:
-                quiet_start = now
-            elif now - quiet_start >= quiet_s:
-                break
-            continue
-        rms = _pcm16_rms(bytes(frame.data))
-        if rms < RMS_SPEECH_THRESHOLD:
-            if quiet_start is None:
-                quiet_start = now
-            elif now - quiet_start >= quiet_s:
-                break
-        else:
-            quiet_start = None
+        await mic.get_frame(timeout=0.05)
     mic.clear()
 
 
@@ -488,13 +471,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     _save_transcript_line(call_sid, f"assistant: {bye}")
                     await _publish_tts_with_barge_in(ctx.room, bye, mic)
                     break
-                nudge = (
-                    "Sorry, I did not catch that. "
-                    + prompt_for_pending((prior or {}).get("pending_field"), prior)
-                )
-                _save_transcript_line(call_sid, f"assistant: {nudge}")
-                await _publish_tts_with_barge_in(ctx.room, nudge, mic)
-                await _settle_mic(mic)
+                # Stay silent and keep listening — do not re-prompt over the caller.
                 continue
 
             filler_task: asyncio.Task[bool] | None = None

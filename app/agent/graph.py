@@ -255,7 +255,7 @@ def last_assistant_question(state: IntakeState | dict[str, Any] | None) -> str:
         content = (turn.get("content") or "").strip()
         if content:
             return content
-    return "Sorry, I didn't catch that. Could you say that again?"
+    return ""
 
 
 def _token_set(text: str) -> set[str]:
@@ -289,18 +289,15 @@ def prompt_for_pending(
     pending: str | None,
     state: IntakeState | dict[str, Any] | None = None,
 ) -> str:
-    """Spoken re-ask: reuse the last question only while still on the same field."""
+    """Spoken re-ask: reuse the last real intake question while still on that field."""
     prior_pending = (state or {}).get("pending_field")
     if pending and pending == prior_pending:
         prior_q = last_assistant_question(state)
         if prior_q:
             return prior_q
     if not pending or pending in {"recording_notice", "close"}:
-        return "Sorry, I didn't catch that. Could you say that again?"
-    return _FIELD_PROMPTS.get(
-        pending,
-        "Sorry, I didn't catch that. Could you say that again?",
-    )
+        return ""
+    return _FIELD_PROMPTS.get(pending, "")
 
 
 def _apply_utterance_to_pending(
@@ -809,7 +806,7 @@ def extract_and_validate(state: IntakeState) -> IntakeState:
         reply, state
     ):
         log.info("Dropped greeting replay from model reply | call_sid=%s", state["call_sid"])
-        reply = last_assistant_question(state)
+        reply = prompt_for_pending(pending or state.get("pending_field"), state)
 
     messages = list(state.get("messages") or [])
     messages.append({"role": "user", "content": state["user_text"]})
