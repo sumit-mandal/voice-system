@@ -459,7 +459,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     break
                 nudge = (
                     "Sorry, I did not catch that. "
-                    + prompt_for_pending((prior or {}).get("pending_field"))
+                    + prompt_for_pending((prior or {}).get("pending_field"), prior)
                 )
                 _save_transcript_line(call_sid, f"assistant: {nudge}")
                 await _publish_tts_with_barge_in(ctx.room, nudge, mic)
@@ -509,7 +509,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     break
                 nudge = (
                     "Sorry, I could not understand. "
-                    + prompt_for_pending((prior or {}).get("pending_field"))
+                    + prompt_for_pending((prior or {}).get("pending_field"), prior)
                 )
                 _save_transcript_line(call_sid, f"assistant: {nudge}")
                 await _publish_tts_with_barge_in(ctx.room, nudge, mic)
@@ -531,7 +531,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     break
                 nudge = (
                     "Sorry, I could not understand. "
-                    + prompt_for_pending((prior or {}).get("pending_field"))
+                    + prompt_for_pending((prior or {}).get("pending_field"), prior)
                 )
                 _save_transcript_line(call_sid, f"assistant: {nudge}")
                 await _publish_tts_with_barge_in(ctx.room, nudge, mic)

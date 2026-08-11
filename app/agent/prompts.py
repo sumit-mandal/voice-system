@@ -49,27 +49,23 @@ Phone turn protocol:
      relationship_to_child if missing.
    - Never say the caller's name is Ankit when Ankit is the child. Never address the
      caller as the child.
-8) UNCLEAR ANSWERS — TWO TRIES (strict):
-   Important fields: caller_name, relationship, callback, child_name, child_dob,
-   location, diagnosis, insurance, member_id (treat other checklist fields the same).
-   Use state unclear_streak (how many times the current pending_field already failed).
-   - If the utterance does not clearly answer pending_field (garbled STT, barge-in junk,
-     off-topic, vague, or only an acknowledgment like "yes" / "calling about a child"
-     when you still need the field): set utterance_unclear=true, keep pending_field the
-     SAME, do NOT add it to skipped_fields, do NOT advance. Briefly say you did not catch
-     that, then re-ask the SAME field in one clear question.
-   - Give at least TWO unclear tries on the same pending_field before giving up
-     (unclear_streak will be 0, then 1 on first failure, then 2 on second failure).
-   - Only when unclear_streak is already >= 1 and this turn is still unusable (second
-     failed try), you may skip: add pending_field to capture.skipped_fields, advance
-     pending_field to the next missing field, set utterance_unclear=false, and in reply
-     CLEARLY tell the caller you did not get that answer after a couple of tries, you are
-     leaving it for the care team, and then ask the NEXT question by name (never say only
-     "continue with the next detail").
-   - If the caller later asks whether you got a skipped field (e.g. their name), reopen
-     that field: remove it from skipped_fields, set pending_field back, and ask again.
-   - For insurance carriers, accept short clear answers like "Tata AIG", "Blue Cross",
-     or "Meridian" without re-asking.
+8) ACCEPT, SKIP, OR CLARIFY (strict — no canned phrasing):
+   Decide from meaning, not from a phrase list.
+   - ACCEPT: If the latest utterance (or a restatement of an earlier turn) answers
+     pending_field, store it in the matching slot, set utterance_unclear=false,
+     field_skipped=false, and advance pending_field to the next missing item.
+     Acknowledge briefly, then ask only the next missing field. Never re-ask a field
+     that already has a value. Repeating or confirming a prior answer still counts
+     as answered.
+   - SKIP: If the caller declines this question or asks to skip it, do not treat that
+     as unclear. Set field_skipped=true, add pending_field to capture.skipped_fields,
+     utterance_unclear=false, acknowledge briefly, and ask the next missing field.
+   - UNCLEAR: Only if the utterance neither answers nor declines pending_field
+     (garbled, off-topic, or empty of the needed fact). Set utterance_unclear=true,
+     keep pending_field the same, and re-ask once in your own words. After two failed
+     tries (see unclear_streak), skip with field_skipped, say you did not get it, and
+     ask the next field by name. Never say only "continue with the next detail".
+   - If they later want to give a skipped field, reopen it.
 9) FULL CHECKLIST: Ask one natural question at a time and cover, in order: caller name,
    relationship, callback number, best callback time, child first+last name, DOB,
    city+ZIP, preferred language/interpreter, diagnosis, diagnosing provider+date,
@@ -109,7 +105,8 @@ Return ONLY valid JSON:
   "handoff_reason": string,
   "handoff_summary": string,
   "caller_ended": boolean,
-  "utterance_unclear": boolean
+  "utterance_unclear": boolean,
+  "field_skipped": boolean
 }}
 
 capture should use these exact keys when applicable: best_callback_time,
@@ -157,11 +154,9 @@ Recent conversation:
 Latest caller utterance:
 {user_text!r}
 
-Respond with JSON only. Extract fields from the latest utterance; keep prior slots.
-If pending_field is insurance and they named a carrier, set insurance_carrier and move on.
-Use unclear_streak from Known Ava slots: if the utterance does not answer pending_field,
-set utterance_unclear=true and re-ask the same field (two tries minimum before skip).
-Only after two failed tries, skip with an explicit "I didn't get that, moving on" plus the
-next concrete question. If they want to end or pause the call, set caller_ended=true and
-close — do not re-ask.
+Respond with JSON only. Extract fields from the latest utterance and from restated
+answers in recent conversation; keep prior slots. If pending_field is already answered,
+do not re-ask it. If they decline the current question, set field_skipped=true and
+advance. Use utterance_unclear only when the utterance neither answers nor declines.
+If they want to end or pause the call, set caller_ended=true and close — do not re-ask.
 """

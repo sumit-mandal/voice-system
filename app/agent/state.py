@@ -86,3 +86,4 @@ class IntakeState(TypedDict):
     medications: str | None
     caller_ended: bool
     utterance_unclear: bool
+    field_skipped: bool
