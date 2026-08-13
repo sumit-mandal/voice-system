@@ -14,7 +14,8 @@ class Settings(BaseSettings):
 
     app_env: str = "dev"
     log_level: str = "DEBUG"
-    public_base_url: str = "http://localhost:8000"
+    public_base_url: str = "http://localhost:8010"
+
 
     # Gemini (primary LLM for intake agent)
     gemini_api_key: str
