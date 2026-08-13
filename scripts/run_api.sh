@@ -10,4 +10,6 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
+# 8010 avoids EC2 conflicts: nginx/legacy FastAPI claim 8000; /opt/myapp uses 8045.
+PORT="${APP_PORT:-8010}"
+exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}" --reload --log-level debug

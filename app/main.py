@@ -50,6 +50,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
+    root_path="/voice" ,
     title="Healthcare Voice Intake",
     version="0.1.0",
     lifespan=lifespan,
